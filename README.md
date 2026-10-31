@@ -8,6 +8,7 @@ A launcher for the games and apps you have outside Steam, for Linux.
 - **Grid of covers or a list.** Covers come from the Steam store or SteamGridDB (free API key, for games that aren't on Steam), or any image: pick one or drop it on the tile. Windows programs get their `.exe` icon automatically.
 - **Themes:** Midnight, Gold, Tokyo Night, Catppuccin, Dracula, Rosé Pine, Nord, Gruvbox, Emerald, Crimson, OLED and Light, with any accent colour. Three grid sizes.
 - **Per game:** its own prefix, arguments, start folder, environment variables, a command prefix (`gamescope -f --`), MangoHud and GameMode. Prefix tools: winecfg, regedit, winetricks (downloadable from Settings), running another `.exe` in the prefix, stopping it.
+- **Drop to add:** drop a `.zip`/`.rar`/`.7z`/`.tar` archive and it's unpacked into your games folder (`~/Games/<Name>`, changeable) and the Add dialog opens with the main program already picked. Drop a folder to copy or move it there (or use it in place). Drop an installer (`setup.exe`) to run it in a new prefix; when it finishes, Hangar finds what it installed. Drop files on a game to put them in its folder (mods, patches), unpacking archives into it if you like; a single image sets the cover. RAR, 7z and the rest unpack with the bundled bsdtar, or the system's unrar/7z when it has them.
 - Playtime and last played, sorting, search, the last launch log, app-menu shortcuts, and drag and drop of program files to add them.
 
 ## Get it

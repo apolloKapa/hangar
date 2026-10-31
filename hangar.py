@@ -39,7 +39,7 @@ from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDialog
                              QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
                              QScrollArea, QSizePolicy, QToolButton, QVBoxLayout, QWidget)
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 HOME = os.path.expanduser("~")
 CONF_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "hangar")
 DATA = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local/share"), "hangar")
@@ -93,7 +93,7 @@ DEFAULT_SETTINGS = {
     "theme": "Midnight", "accent": "", "view": "grid", "size": "medium", "kind": "game", "tab": "library",
     "sort": "name", "proton": "", "wine": "", "windows_runner": "proton",
     "prefix_root": os.path.join(HOME, "Games", "Hangar", "prefixes"), "use_umu": True,
-    "show_nsfw": False, "blur_nsfw": True, "sgdb_key": "",
+    "show_nsfw": False, "blur_nsfw": True, "sgdb_key": "", "games_root": os.path.join(HOME, "Games"),
 }
 
 
@@ -210,7 +210,8 @@ def host_env():
                     "SSL_CERT_FILE", "SSL_CERT_DIR", "GDK_PIXBUF_MODULE_FILE", "GIO_MODULE_DIR", "TCL_LIBRARY",
                     "TK_LIBRARY"):
             env.pop(key, None)
-    for key in [k for k in env if k.startswith(("_PYI", "_MEI"))] + ["APPDIR", "APPIMAGE", "ARGV0", "OWD"]:
+    for key in [k for k in env if k.startswith(("_PYI", "_MEI"))] + ["APPDIR", "APPIMAGE", "ARGV0", "OWD",
+                                                                    "HANGAR_BSDTAR"]:
         env.pop(key, None)
     # Hangar's own tools (a downloaded winetricks) come last, after the system's
     env["PATH"] = env.get("PATH", "/usr/bin:/bin") + ":" + os.path.join(TOOLS, "bin")
@@ -539,6 +540,205 @@ def open_path(path):
                          start_new_session=True)
     except OSError:
         pass
+
+
+# ---- archives, folders and installers ----------------------------------------------------------
+
+ARCHIVE_RE = re.compile(r"\.(zip|rar|7z|tar|tgz|txz|tbz2|tar\.(gz|xz|bz2|zst|lz4)|7z\.001)$", re.I)
+LATER_PART_RE = re.compile(r"(\.part0*([2-9]|\d{2,})\.rar|\.r\d\d|\.7z\.(?!001)\d{3}|\.z\d\d)$", re.I)
+IMAGE_EXT = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+SKIP_PROGRAMS = re.compile(
+    r"unins|uninstall|crash|redist|vc_?redist|dxsetup|dxwebsetup|directx|dotnet|ue4prereq|prereq|physx|"
+    r"easyanticheat|battleye|notification_helper|qtwebengineprocess|cefsharp|subprocess|helper|reporter|"
+    r"vcrun|oalinst|xnafx|7z(a|g|fm)?\.exe|unitycrashhandler|winrar|unrar|dosbox_?debug", re.I)
+INSTALLER_RE = re.compile(r"^(setup|install|installer)([-_ .][^/]*)?\.exe$|[-_ ]setup[^/]*\.exe$|^setup_.*\.exe$", re.I)
+
+
+def is_archive(path):
+    return bool(ARCHIVE_RE.search(path)) and not LATER_PART_RE.search(path)
+
+
+def is_installer(path):
+    return bool(INSTALLER_RE.search(os.path.basename(path)))
+
+
+def archive_name(path):
+    """a game name from an archive's file name: without extensions, part numbers, [tags] and versions"""
+    base = os.path.basename(path)
+    base = re.sub(r"(\.part0*1)?\.(zip|rar|7z|tar|tgz|txz|tbz2|tar\.\w+|7z\.001)$", "", base, flags=re.I)
+    base = re.sub(r"[\[({].*?[\])}]", " ", base)
+    base = re.sub(r"[-_.]+", " ", base)
+    base = re.sub(r"\b(v|ver|version|build)\s*\d[\d ]*\b.*$", "", base, flags=re.I)
+    base = re.sub(r"\b(x64|x86|win64|win32|windows|linux|portable|repack|gog|steamrip|multi\d*)\b", "", base,
+                  flags=re.I)
+    base = re.sub(r"(\s+\d+)+\s*$", "", base.strip())
+    base = re.sub(r"\s+", " ", base).strip() or os.path.basename(path)
+    return base[:1].upper() + base[1:] if base.islower() else base
+
+
+def unique_dir(parent, name):
+    name = re.sub(r"[/\\:*?\"<>|]+", " ", name).strip() or "Game"
+    path = os.path.join(parent, name)
+    n = 2
+    while os.path.exists(path):
+        path = os.path.join(parent, f"{name} ({n})")
+        n += 1
+    return path
+
+
+def bsdtar():
+    return os.environ.get("HANGAR_BSDTAR") if os.path.isfile(os.environ.get("HANGAR_BSDTAR") or "") \
+        else which("bsdtar")
+
+
+def extract(archive, dest, report=lambda _x: None):
+    """unpacks an archive into dest, with whichever tool can: unrar/7z/bsdtar/unzip/tar"""
+    env = host_env()
+    low = archive.lower()
+    tools = []
+    bt = bsdtar()
+    if low.endswith(".7z.001"):
+        tools = [["7z", "x", "-y", f"-o{dest}", archive]]
+    elif low.endswith(".rar"):
+        tools = [["unrar", "x", "-o+", "-y", "-idq", archive, dest + "/"], ["7z", "x", "-y", f"-o{dest}", archive]]
+        if bt:
+            tools.append([bt, "-xvf", archive, "-C", dest])
+    else:
+        if bt:
+            tools.append([bt, "-xvf", archive, "-C", dest])
+        tools.append(["7z", "x", "-y", f"-o{dest}", archive])
+        if low.endswith(".zip"):
+            tools.append(["unzip", "-o", "-q", archive, "-d", dest])
+        else:
+            tools.append(["tar", "-xf", archive, "-C", dest])
+    errors = []
+    for cmd in tools:
+        exe = cmd[0] if os.path.isabs(cmd[0]) else shutil.which(cmd[0], path=env["PATH"])
+        if not exe:
+            continue
+        os.makedirs(dest, exist_ok=True)
+        total = 0
+        if os.path.basename(exe) == "bsdtar":
+            try:
+                listing = subprocess.run([exe, "-tf", archive], env=env, capture_output=True, timeout=300)
+                total = listing.stdout.count(b"\n")
+            except (OSError, subprocess.SubprocessError):
+                total = 0
+        report(("unpack", 0, total))
+        p = subprocess.Popen([exe] + cmd[1:], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT)
+        done, tail = 0, []
+        for line in p.stdout:
+            done += 1
+            tail = (tail + [line.decode("utf-8", "replace").strip()])[-6:]
+            if total and done % 20 == 0:
+                report(("unpack", min(done, total), total))
+        if p.wait() == 0:
+            return dest
+        errors.append(f"{os.path.basename(exe)}: " + (" / ".join(t for t in tail if t) or f"exit {p.returncode}"))
+        # start the next tool on an empty folder
+        for item in os.listdir(dest):
+            path = os.path.join(dest, item)
+            shutil.rmtree(path, ignore_errors=True) if os.path.isdir(path) and not os.path.islink(path) \
+                else os.remove(path)
+    if not errors:
+        need = "7z" if low.endswith(".7z.001") else "bsdtar, unrar or 7z"
+        raise RuntimeError(f"nothing here can unpack it; install {need}")
+    raise RuntimeError(errors[-1] if len(errors) == 1 else "; ".join(errors))
+
+
+def flatten(folder):
+    """an archive with one folder inside: its contents move up into `folder`"""
+    items = [i for i in os.listdir(folder) if i not in ("__MACOSX",)]
+    if len(items) != 1 or not os.path.isdir(os.path.join(folder, items[0])):
+        return
+    tmp = os.path.join(folder, f".hangar-{uuid.uuid4().hex[:6]}")
+    os.rename(os.path.join(folder, items[0]), tmp)
+    for item in os.listdir(tmp):
+        shutil.move(os.path.join(tmp, item), os.path.join(folder, item))
+    os.rmdir(tmp)
+    shutil.rmtree(os.path.join(folder, "__MACOSX"), ignore_errors=True)
+
+
+def is_native_program(path):
+    low = path.lower()
+    if low.endswith((".x86_64", ".x86", ".appimage")):
+        return True
+    if low.endswith(".sh"):
+        return os.path.basename(low) in ("start.sh", "run.sh", "launch.sh", "play.sh") or os.access(path, os.X_OK)
+    if "." in os.path.basename(path) or not os.access(path, os.X_OK):
+        return False
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
+def find_programs(folder, newer_than=0, max_depth=6):
+    """likely main programs in a folder, best first: [path]"""
+    want = re.sub(r"[^a-z0-9]", "", os.path.basename(folder.rstrip("/")).lower())
+    found = []
+    root_depth = folder.rstrip("/").count("/")
+    for dirpath, dirnames, filenames in os.walk(folder):
+        depth = dirpath.count("/") - root_depth
+        if depth >= max_depth:
+            dirnames[:] = []
+        dirnames[:] = [d for d in dirnames if d.lower() not in ("windows", "__macosx", "_commonredist", "redist",
+                                                                 "directx", "dotnetfx", "vcredist", "support",
+                                                                 "temp", "appdata", "internet explorer",
+                                                                 "windows nt", "windows media player",
+                                                                 "common files", "msbuild")]
+        for fn in filenames:
+            path = os.path.join(dirpath, fn)
+            win = fn.lower().endswith(".exe")
+            if not (win or is_native_program(path)) or SKIP_PROGRAMS.search(fn):
+                continue
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if newer_than and st.st_ctime < newer_than:
+                continue
+            name = re.sub(r"[^a-z0-9]", "", os.path.splitext(fn)[0].lower())
+            score = -depth * 12 + min(st.st_size, 300 << 20) / (6 << 20)
+            if want and name and (name in want or want in name):
+                score += 40
+            if is_installer(fn):
+                score -= 60
+            if "launcher" in name:
+                score -= 5
+            found.append((score, path))
+    return [p for _s, p in sorted(found, reverse=True)]
+
+
+def copy_into(paths, dest, move=False, unpack=False, report=lambda _x: None):
+    """copies (or moves) files and folders into dest, unpacking archives there if `unpack`"""
+    os.makedirs(dest, exist_ok=True)
+    for i, src in enumerate(paths):
+        report(("copy", i, len(paths)))
+        if unpack and os.path.isfile(src) and is_archive(src):
+            extract(src, dest, report)
+            continue
+        target = os.path.join(dest, os.path.basename(src.rstrip("/")))
+        if move:
+            if os.path.isdir(target) and os.path.isdir(src):
+                shutil.copytree(src, target, symlinks=True, dirs_exist_ok=True)
+                shutil.rmtree(src)
+            else:
+                shutil.move(src, target)
+        elif os.path.isdir(src):
+            shutil.copytree(src, target, symlinks=True, dirs_exist_ok=True)
+        else:
+            shutil.copy2(src, target)
+    return dest
+
+
+def game_folder(e):
+    if e["cwd"] and os.path.isdir(os.path.expanduser(e["cwd"])):
+        return os.path.expanduser(e["cwd"])
+    exe = os.path.expanduser(e["exe"])
+    return os.path.dirname(exe) if os.path.isfile(exe) else ""
 
 
 # ---- menu shortcuts ----------------------------------------------------------------------------
@@ -1314,16 +1514,18 @@ RUNNING_TASKS = []
 class EditDialog(QDialog):
     """add or edit a game or app"""
 
-    def __init__(self, parent, entry=None, kind="game", exe=""):
+    def __init__(self, parent, entry=None, kind="game", exe="", preset=None, start_dir=""):
         super().__init__(parent)
         self.s = settings()
         self.new = entry is None
+        self.start_dir = start_dir
         self.e = dict(ENTRY_DEFAULTS, **(entry or {}))
         if self.new:
             self.e.update(id=new_id(), kind=kind, added=int(time.time()))
             if exe:
                 self.e.update(exe=exe, name=guess_name(exe),
                               runner=self.s["windows_runner"] if is_windows(exe) else "native")
+            self.e.update(preset or {})
         self.cover_data = None
         self.cover_cleared = False
         self.icon_src = None
@@ -1515,7 +1717,7 @@ class EditDialog(QDialog):
 
     # program
     def browse_exe(self):
-        start = os.path.dirname(self.exe.text()) if os.path.isfile(self.exe.text()) else HOME
+        start = os.path.dirname(self.exe.text()) if os.path.isfile(self.exe.text()) else (self.start_dir or HOME)
         path, _ = QFileDialog.getOpenFileName(self, "Choose the program", start,
                                               "Programs (*.exe *.msi *.bat *.lnk *.AppImage *.appimage *.sh "
                                               "*.x86_64 *.x86 *.bin);;All files (*)")
@@ -1819,6 +2021,11 @@ class SettingsDialog(QDialog):
         self.blur_nsfw = QCheckBox("Blur NSFW covers outside the NSFW tab")
         self.blur_nsfw.setChecked(self.s["blur_nsfw"])
         content.addRow("", self.blur_nsfw)
+        grow2 = QHBoxLayout()
+        self.games_root = QLineEdit(self.s["games_root"])
+        grow2.addWidget(self.games_root, 1)
+        grow2.addWidget(button("Browse…", self.browse_games))
+        content.addRow("Dropped games go in", grow2)
 
         covers = panel("Covers")
         self.sgdb = QLineEdit(self.s["sgdb_key"])
@@ -1880,6 +2087,12 @@ class SettingsDialog(QDialog):
         self.accent = ""
         self.preview()
 
+    def browse_games(self):
+        path = QFileDialog.getExistingDirectory(self, "Dropped games go in",
+                                                os.path.expanduser(self.games_root.text()))
+        if path:
+            self.games_root.setText(path)
+
     def browse_root(self):
         path = QFileDialog.getExistingDirectory(self, "New prefixes go in", os.path.expanduser(self.prefix_root.text()))
         if path:
@@ -1933,7 +2146,8 @@ class SettingsDialog(QDialog):
                       wine=self.wine.currentData() or "",
                       prefix_root=self.prefix_root.text().strip() or DEFAULT_SETTINGS["prefix_root"],
                       use_umu=self.use_umu.isChecked(), show_nsfw=self.show_nsfw.isChecked(),
-                      blur_nsfw=self.blur_nsfw.isChecked(), sgdb_key=self.sgdb.text().strip())
+                      blur_nsfw=self.blur_nsfw.isChecked(), sgdb_key=self.sgdb.text().strip(),
+                      games_root=self.games_root.text().strip() or DEFAULT_SETTINGS["games_root"])
         self.accept()
 
     def done(self, r):
@@ -2016,15 +2230,16 @@ class EntryWidget(QFrame):
             self.win.play(self.e["id"])
 
     def dragEnterEvent(self, ev):
-        urls = ev.mimeData().urls()
-        if len(urls) == 1 and urls[0].isLocalFile() and \
-                urls[0].toLocalFile().lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp")):
+        if any(u.isLocalFile() and os.path.exists(u.toLocalFile()) for u in ev.mimeData().urls()):
             ev.acceptProposedAction()
 
     def dropEvent(self, ev):
-        path = ev.mimeData().urls()[0].toLocalFile()
+        paths = [u.toLocalFile() for u in ev.mimeData().urls() if u.isLocalFile() and os.path.exists(u.toLocalFile())]
         ev.acceptProposedAction()
-        self.win.set_cover_file(self.e["id"], path)
+        if len(paths) == 1 and paths[0].lower().endswith(IMAGE_EXT):
+            self.win.set_cover_file(self.e["id"], paths[0])
+        elif paths:
+            QTimer.singleShot(0, lambda: self.win.add_to_game_folder(self.e["id"], paths))
 
 
 def play_button(win, e, round_=False):
@@ -2224,9 +2439,17 @@ class Window(QMainWindow):
         self.scroll.setWidget(self.holder)
         v.addWidget(self.scroll, 1)
 
-        self.tip = "Tip: drop a program file anywhere on this window to add it · double-click a game to play"
+        self.tip = ("Tip: drop a program, folder or archive (.zip/.rar/.7z) on this window to add it · "
+                    "drop files on a game to put them in its folder")
         self.status = label(self.tip, "muted")
-        v.addWidget(self.status)
+        srow = QHBoxLayout()
+        srow.addWidget(self.status, 1)
+        self.busy_bar = QProgressBar()
+        self.busy_bar.setFixedSize(220, 10)
+        self.busy_bar.hide()
+        srow.addWidget(self.busy_bar)
+        v.addLayout(srow)
+        self.tasks = []
         self.status_timer = QTimer(self)
         self.status_timer.setSingleShot(True)
         self.status_timer.timeout.connect(lambda: self.status.setText(self.tip))
@@ -2410,6 +2633,208 @@ class Window(QMainWindow):
             self.refresh()
             self.say(f"Added {e['name']}.")
 
+    # adding by dropping
+    def run_task(self, text, fn, on_done):
+        """runs fn(report) in the background with the busy bar; on_done(result, error) afterwards"""
+        task = Task(fn, self)
+        self.tasks.append(task)
+        self.status_timer.stop()
+        self.status.setText(text)
+        self.busy_bar.setRange(0, 0)
+        self.busy_bar.show()
+
+        def progress(info):
+            _stage, done, total = info[:3]
+            if total and len(self.tasks) == 1:
+                self.busy_bar.setRange(0, total)
+                self.busy_bar.setValue(done)
+
+        def finished(result, error):
+            self.tasks.remove(task)
+            if not self.tasks:
+                self.busy_bar.hide()
+            self.status.setText(self.tip)
+            on_done(result, error)
+
+        task.progress.connect(progress)
+        task.done.connect(finished)
+        task.start()
+
+    def import_paths(self, paths):
+        """what dropping on the window (or opening files with Hangar) does"""
+        archives = [p for p in paths if os.path.isfile(p) and is_archive(p)]
+        folders = [p for p in paths if os.path.isdir(p)]
+        programs = [p for p in paths if os.path.isfile(p) and p not in archives and not LATER_PART_RE.search(p)]
+        for a in archives[:5]:
+            self.import_archive(a)
+        for f in folders[:5]:
+            self.import_folder(f)
+        for p in programs[:5]:
+            if is_windows(p) and is_installer(p):
+                r = QMessageBox.question(self, "Run the installer?",
+                                         f"{os.path.basename(p)} looks like an installer.\n\nRun it in a new prefix "
+                                         "now? When it finishes, Hangar finds the installed game and adds it.\n\n"
+                                         "No adds the file itself as the program.")
+                if r == QMessageBox.StandardButton.Yes:
+                    self.run_installer(p, guess_name(p))
+                    continue
+            self.add(p)
+
+    def import_archive(self, archive):
+        name = archive_name(archive)
+        root = os.path.expanduser(self.s["games_root"])
+        dest = unique_dir(root, name)
+
+        def work(report):
+            extract(archive, dest, report)
+            flatten(dest)
+            return dest
+
+        def done(folder, error):
+            if error:
+                shutil.rmtree(dest, ignore_errors=True)
+                QMessageBox.warning(self, "Couldn't unpack it", f"{os.path.basename(archive)}:\n\n{error}")
+                return
+            self.say(f"Unpacked into {folder}")
+            self.add_from_folder(folder, name)
+
+        self.run_task(f"Unpacking {os.path.basename(archive)} into {dest}…", work, done)
+
+    def import_folder(self, folder):
+        root = os.path.expanduser(self.s["games_root"])
+        box = QMessageBox(self)
+        box.setWindowTitle("Add a folder")
+        box.setText(f"Add the game in {os.path.basename(folder.rstrip('/'))}?")
+        box.setInformativeText(f"Copy or move it into your games folder ({root}), or use it where it is.")
+        copy = box.addButton("Copy there", QMessageBox.ButtonRole.AcceptRole)
+        move = box.addButton("Move there", QMessageBox.ButtonRole.AcceptRole)
+        keep = box.addButton("Use where it is", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(keep)
+        box.exec()
+        clicked = box.clickedButton()
+        name = guess_name(os.path.join(folder.rstrip("/"), "game.exe"))
+        if clicked is keep:
+            self.add_from_folder(folder, name)
+            return
+        if clicked not in (copy, move):
+            return
+        if os.path.realpath(folder).startswith(os.path.realpath(root) + "/"):
+            self.add_from_folder(folder, name)
+            return
+        dest = unique_dir(root, os.path.basename(folder.rstrip("/")))
+
+        def work(report):
+            if clicked is move:
+                try:
+                    os.makedirs(root, exist_ok=True)
+                    os.rename(folder, dest)  # instant on the same drive
+                    return dest
+                except OSError:
+                    pass
+            shutil.copytree(folder, dest, symlinks=True)
+            if clicked is move:
+                shutil.rmtree(folder)
+            return dest
+
+        def done(path, error):
+            if error:
+                QMessageBox.warning(self, "Couldn't copy it", str(error))
+                return
+            self.add_from_folder(path, name)
+
+        self.run_task(f"{'Moving' if clicked is move else 'Copying'} {os.path.basename(folder)} to {dest}…", work, done)
+
+    def add_from_folder(self, folder, name):
+        programs = find_programs(folder)
+        best = programs[0] if programs else ""
+        if best and is_installer(best) and not any(not is_installer(p) for p in programs):
+            r = QMessageBox.question(self, "Run the installer?",
+                                     f"{name} comes as an installer ({os.path.basename(best)}).\n\nRun it in a new "
+                                     "prefix now? When it finishes, Hangar finds the installed game and adds it.")
+            if r == QMessageBox.StandardButton.Yes:
+                self.run_installer(best, name)
+                return
+        preset = {"name": name}
+        if best:
+            preset.update(exe=best, runner=self.s["windows_runner"] if is_windows(best) else "native")
+        else:
+            self.say(f"Couldn't find a program in {folder}: pick it with Browse.", 12)
+        d = EditDialog(self, kind=self.s["kind"], preset=preset, start_dir=folder)
+        if d.exec():
+            self.refresh()
+            self.say(f"Added {d.e['name']}.")
+
+    def run_installer(self, installer, name):
+        e = dict(ENTRY_DEFAULTS, id=new_id(), name=name, kind=self.s["kind"], runner=self.s["windows_runner"],
+                 added=int(time.time()))
+        e["prefix"] = prefix_of(e, self.s)
+        if os.path.exists(e["prefix"]):
+            e["prefix"] = unique_dir(os.path.dirname(e["prefix"]), os.path.basename(e["prefix"]))
+        started = time.time()
+        try:
+            p = start_process(e, target=installer, extra=[], log_name=f"{e['id']}-install")
+        except (LaunchError, OSError) as ex:
+            QMessageBox.warning(self, "Can't run the installer", str(ex))
+            return
+        self.say(f"Installing {name}: finish the installer, then Hangar asks what to add. "
+                 "(A new prefix takes a minute to set up first.)", 30)
+        timer = QTimer(self)
+
+        def check():
+            if p.poll() is None:
+                return
+            timer.stop()
+            timer.deleteLater()
+            drive = os.path.join(wine_prefix(e, self.s), "drive_c")
+            programs = [x for x in find_programs(drive, newer_than=started - 5, max_depth=7) if not is_installer(x)]
+            preset = dict(e, exe=programs[0] if programs else "")
+            if not programs:
+                self.say("The installer finished, but Hangar couldn't tell what it installed: pick the program "
+                         "with Browse (it starts in the prefix's C: drive).", 15)
+            d = EditDialog(self, kind=e["kind"], preset=preset, start_dir=drive)
+            if d.exec():
+                self.refresh()
+                self.say(f"Added {d.e['name']}.")
+            elif os.path.isdir(e["prefix"]) and QMessageBox.question(
+                    self, "Delete the prefix?", f"Not added. Delete the prefix the installer used?\n{e['prefix']}") \
+                    == QMessageBox.StandardButton.Yes:
+                shutil.rmtree(e["prefix"], ignore_errors=True)
+
+        timer.timeout.connect(check)
+        timer.start(1000)
+
+    def add_to_game_folder(self, eid, paths):
+        e = get_entry(eid)
+        if not e:
+            return
+        folder = game_folder(e)
+        if not folder:
+            return self.say(f"{e['name']} has no folder to put files in (it runs a command).")
+        archives = [p for p in paths if os.path.isfile(p) and is_archive(p)]
+        names = ", ".join(os.path.basename(p.rstrip("/")) for p in paths[:3]) + (" …" if len(paths) > 3 else "")
+        box = QMessageBox(self)
+        box.setWindowTitle(f"Add to {e['name']}")
+        box.setText(f"Put {names} into {e['name']}'s folder?")
+        box.setInformativeText(f"{folder}\n\nFiles with the same names there are replaced.")
+        unpack = box.addButton("Unpack into it", QMessageBox.ButtonRole.AcceptRole) if archives else None
+        copy = box.addButton("Copy as they are" if archives else "Copy", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(unpack or copy)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked not in (unpack, copy) or clicked is None:
+            return
+
+        def done(_r, error):
+            if error:
+                QMessageBox.warning(self, "Couldn't add the files", str(error))
+            else:
+                self.say(f"Added {names} to {folder}")
+
+        self.run_task(f"Adding files to {e['name']}…",
+                      lambda report: copy_into(paths, folder, unpack=clicked is unpack, report=report), done)
+
     def edit(self, eid):
         e = get_entry(eid)
         if e and EditDialog(self, e).exec():
@@ -2563,8 +2988,8 @@ class Window(QMainWindow):
 
     # drag and drop
     def dragEnterEvent(self, e):
-        urls = [u for u in e.mimeData().urls() if u.isLocalFile() and os.path.isfile(u.toLocalFile())]
-        if urls and not urls[0].toLocalFile().lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp")):
+        urls = [u for u in e.mimeData().urls() if u.isLocalFile() and os.path.exists(u.toLocalFile())]
+        if urls and not urls[0].toLocalFile().lower().endswith(IMAGE_EXT):
             e.acceptProposedAction()
             self.overlay.setGeometry(self.centralWidget().rect().adjusted(10, 10, -10, -10))
             self.overlay.raise_()
@@ -2575,10 +3000,9 @@ class Window(QMainWindow):
 
     def dropEvent(self, e):
         self.overlay.hide()
-        files = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile() and os.path.isfile(u.toLocalFile())]
+        paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile() and os.path.exists(u.toLocalFile())]
         e.acceptProposedAction()
-        for f in files[:5]:
-            QTimer.singleShot(0, lambda f=f: self.add(f))
+        QTimer.singleShot(0, lambda: self.import_paths(paths))
 
     def closeEvent(self, e):
         if self.launcher.running:
@@ -2655,9 +3079,9 @@ def main():
     apply_theme(app)
     w = Window()
     w.show()
-    files = [a for a in sys.argv[1:] if os.path.isfile(a)]
-    for f in files[:5]:
-        QTimer.singleShot(200, lambda f=f: w.add(f))
+    paths = [os.path.abspath(a) for a in sys.argv[1:] if os.path.exists(a)]
+    if paths:
+        QTimer.singleShot(200, lambda: w.import_paths(paths))
     sys.exit(app.exec())
 
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Builds dist/Hangar-x86_64.AppImage: a PyInstaller bundle (Python + PyQt6 + certifi) in an AppDir.
+# Builds dist/Hangar-x86_64.AppImage: a PyInstaller bundle (Python + PyQt6 + certifi) in an AppDir, with
+# its own bsdtar for unpacking dropped archives (.zip/.rar/.7z/.tar).
 # GitHub Actions runs this on every v* tag (.github/workflows/appimage.yml); locally it needs
-# python3 and appimagetool (APPIMAGETOOL=/path/to/appimagetool, or on PATH).
+# python3, bsdtar and appimagetool (APPIMAGETOOL=/path/to/appimagetool, or on PATH).
 #   ./build_appimage.sh            full build
 #   ./build_appimage.sh --appdir   stop after the AppDir (no appimagetool needed)
 set -euo pipefail
@@ -59,6 +60,23 @@ mkdir -p "$APPDIR/usr/lib" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/i
 cp -r "$BUILD/dist/hangar" "$APPDIR/usr/lib/hangar"
 cp LICENSE "$APPDIR/usr/lib/hangar/LICENSE"
 
+# bsdtar with the libraries it needs that a desktop may not have (not glibc's own)
+BSDTAR="$(command -v bsdtar)"
+mkdir -p "$APPDIR/usr/lib/bsdtar" "$APPDIR/usr/bin"
+cp "$BSDTAR" "$APPDIR/usr/lib/bsdtar/bsdtar"
+ldd "$BSDTAR" | awk '/=> \//{print $3}' | while read -r so; do
+    case "$(basename "$so")" in
+        libc.so*|libm.so*|libpthread.so*|libdl.so*|librt.so*|ld-linux*) ;;
+        *) cp -L "$so" "$APPDIR/usr/lib/bsdtar/" ;;
+    esac
+done
+cat > "$APPDIR/usr/bin/bsdtar" <<'SH'
+#!/bin/sh
+HERE="$(dirname "$(readlink -f "$0")")/../lib/bsdtar"
+LD_LIBRARY_PATH="$HERE${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$HERE/bsdtar" "$@"
+SH
+chmod +x "$APPDIR/usr/bin/bsdtar"
+
 cp "$BUILD/hangar.png" "$APPDIR/hangar.png"
 cp "$BUILD/hangar.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/hangar.png"
 ln -sf hangar.png "$APPDIR/.DirIcon"
@@ -80,7 +98,8 @@ cp "$APPDIR/hangar.desktop" "$APPDIR/usr/share/applications/hangar.desktop"
 cat > "$APPDIR/AppRun" <<'SH'
 #!/bin/sh
 HERE="$(dirname "$(readlink -f "$0")")"
-exec "$HERE/usr/lib/hangar/hangar" "$@"
+# the bundled bsdtar, for unpacking dropped archives (kept off PATH so games don't see it)
+HANGAR_BSDTAR="$HERE/usr/bin/bsdtar" exec "$HERE/usr/lib/hangar/hangar" "$@"
 SH
 chmod +x "$APPDIR/AppRun"
 

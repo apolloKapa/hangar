@@ -26,7 +26,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y binutils \
+          sudo apt-get install -y binutils libarchive-tools \
             libegl1 libxkbcommon0 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libfontconfig1
 
       - name: Get appimagetool
@@ -45,6 +45,7 @@ jobs:
         run: |
           ./dist/Hangar-x86_64.AppImage --appimage-extract >/dev/null
           ./squashfs-root/AppRun --version
+          ./squashfs-root/usr/bin/bsdtar --version
 
       - uses: actions/upload-artifact@v5
         with:
