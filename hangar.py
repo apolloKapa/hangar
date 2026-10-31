@@ -39,7 +39,7 @@ from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDialog
                              QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
                              QScrollArea, QSizePolicy, QToolButton, QVBoxLayout, QWidget)
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 HOME = os.path.expanduser("~")
 CONF_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "hangar")
 DATA = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local/share"), "hangar")
@@ -563,8 +563,9 @@ def build_command(e, s=None, target=None, extra=None, tool=False):
             cmd = [os.path.join(proton, "proton"), "run" if tool else "waitforexitandrun"] + run
         if e["mangohud"]:
             env["MANGOHUD"] = "1"
-        if s["wayland"] and os.environ.get("WAYLAND_DISPLAY"):
-            # a native Wayland window: X11 windows get lost on monitors at negative positions (niri)
+        if s["wayland"] and not e["vr"] and os.environ.get("WAYLAND_DISPLAY"):
+            # a native Wayland window: X11 windows get lost on monitors at negative positions (niri). Not for VR
+            # games: Proton's OpenVR/DXVK bridge needs X11 (D3D11 fails to create its device otherwise)
             env["PROTON_ENABLE_WAYLAND"] = "1"
     elif runner == "wine":
         wine = runner_path(e, s)
@@ -2135,7 +2136,7 @@ class SettingsDialog(QDialog):
         prow.addWidget(button("Browse…", self.browse_root))
         run.addRow("New prefixes go in", prow)
         umu = which("umu-run")
-        self.wayland = QCheckBox("Run Proton games as Wayland windows")
+        self.wayland = QCheckBox("Run Proton games as Wayland windows (not VR games)")
         self.wayland.setChecked(self.s["wayland"])
         self.wayland.setToolTip("GE-Proton's Wayland mode (PROTON_ENABLE_WAYLAND=1). Windows then move between "
                                 "monitors properly; through X11 they can vanish on a monitor above or left of the "
