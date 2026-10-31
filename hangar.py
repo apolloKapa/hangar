@@ -39,7 +39,7 @@ from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDialog
                              QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
                              QScrollArea, QSizePolicy, QToolButton, QVBoxLayout, QWidget)
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 HOME = os.path.expanduser("~")
 CONF_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "hangar")
 DATA = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local/share"), "hangar")
@@ -93,7 +93,7 @@ DEFAULT_SETTINGS = {
     "theme": "Midnight", "accent": "", "view": "grid", "size": "medium", "kind": "game", "tab": "library",
     "sort": "name", "proton": "", "wine": "", "windows_runner": "proton",
     "prefix_root": os.path.join(HOME, "Games", "Hangar", "prefixes"), "use_umu": True,
-    "show_nsfw": False, "blur_nsfw": True, "sgdb_key": "", "vr_options": "", "start_wivrn": True, "games_root": os.path.join(HOME, "Games"),
+    "show_nsfw": False, "blur_nsfw": True, "sgdb_key": "", "vr_options": "", "start_wivrn": True, "wayland": True, "games_root": os.path.join(HOME, "Games"),
 }
 
 
@@ -563,6 +563,9 @@ def build_command(e, s=None, target=None, extra=None, tool=False):
             cmd = [os.path.join(proton, "proton"), "run" if tool else "waitforexitandrun"] + run
         if e["mangohud"]:
             env["MANGOHUD"] = "1"
+        if s["wayland"] and os.environ.get("WAYLAND_DISPLAY"):
+            # a native Wayland window: X11 windows get lost on monitors at negative positions (niri)
+            env["PROTON_ENABLE_WAYLAND"] = "1"
     elif runner == "wine":
         wine = runner_path(e, s)
         if not wine:
@@ -2132,6 +2135,13 @@ class SettingsDialog(QDialog):
         prow.addWidget(button("Browse…", self.browse_root))
         run.addRow("New prefixes go in", prow)
         umu = which("umu-run")
+        self.wayland = QCheckBox("Run Proton games as Wayland windows")
+        self.wayland.setChecked(self.s["wayland"])
+        self.wayland.setToolTip("GE-Proton's Wayland mode (PROTON_ENABLE_WAYLAND=1). Windows then move between "
+                                "monitors properly; through X11 they can vanish on a monitor above or left of the "
+                                "main one. For one game, put PROTON_ENABLE_WAYLAND=0 in its Environment to turn it "
+                                "off.")
+        run.addRow("", self.wayland)
         self.use_umu = QCheckBox("Use umu-launcher for Proton" + ("" if umu else " (not installed)"))
         self.use_umu.setChecked(self.s["use_umu"])
         self.use_umu.setToolTip("umu runs Proton inside Steam's runtime, like Steam does. Without it, Proton runs "
@@ -2297,6 +2307,7 @@ class SettingsDialog(QDialog):
                       prefix_root=self.prefix_root.text().strip() or DEFAULT_SETTINGS["prefix_root"],
                       use_umu=self.use_umu.isChecked(), show_nsfw=self.show_nsfw.isChecked(),
                       vr_options=self.vr_options.text().strip(), start_wivrn=self.start_wivrn.isChecked(),
+                      wayland=self.wayland.isChecked(),
                       blur_nsfw=self.blur_nsfw.isChecked(), sgdb_key=self.sgdb.text().strip(),
                       games_root=self.games_root.text().strip() or DEFAULT_SETTINGS["games_root"])
         self.accept()
