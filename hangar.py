@@ -39,7 +39,7 @@ from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDialog
                              QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
                              QScrollArea, QSizePolicy, QToolButton, QVBoxLayout, QWidget)
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 HOME = os.path.expanduser("~")
 CONF_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "hangar")
 DATA = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local/share"), "hangar")
@@ -61,7 +61,7 @@ STEAM_ROOTS = [os.path.join(HOME, ".steam/root"), os.path.join(HOME, ".local/sha
 GE_RELEASES = "https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest"
 WINETRICKS_URL = "https://raw.githubusercontent.com/Winetricks/winetricks/master/src/winetricks"
 KINDS = {"game": "Games", "app": "Apps"}
-TABS = {"library": "Library", "favorites": "Favourites", "nsfw": "NSFW", "hidden": "Hidden"}
+TABS = {"library": "Library", "favorites": "Favourites", "vr": "VR", "nsfw": "NSFW", "hidden": "Hidden"}
 SORTS = {"name": "Name", "recent": "Last played", "playtime": "Most played", "added": "Recently added"}
 RUNNER_NAMES = {"native": "Native", "proton": "Proton", "wine": "Wine"}
 SIZES = {"small": 140, "medium": 172, "large": 214}
@@ -93,7 +93,7 @@ DEFAULT_SETTINGS = {
     "theme": "Midnight", "accent": "", "view": "grid", "size": "medium", "kind": "game", "tab": "library",
     "sort": "name", "proton": "", "wine": "", "windows_runner": "proton",
     "prefix_root": os.path.join(HOME, "Games", "Hangar", "prefixes"), "use_umu": True,
-    "show_nsfw": False, "blur_nsfw": True, "sgdb_key": "", "games_root": os.path.join(HOME, "Games"),
+    "show_nsfw": False, "blur_nsfw": True, "sgdb_key": "", "vr_options": "", "start_wivrn": True, "games_root": os.path.join(HOME, "Games"),
 }
 
 
@@ -112,7 +112,7 @@ def save_settings(**changes):
 ENTRY_DEFAULTS = {
     "id": "", "name": "", "kind": "game", "exe": "", "args": "", "cwd": "", "runner": "native", "version": "",
     "prefix": "", "env": "", "wrapper": "", "mangohud": False, "gamemode": False, "favorite": False,
-    "nsfw": False, "hidden": False, "cover": "", "icon": "", "added": 0, "last_played": 0, "playtime": 0,
+    "nsfw": False, "hidden": False, "vr": False, "cover": "", "icon": "", "added": 0, "last_played": 0, "playtime": 0,
 }
 
 
@@ -396,6 +396,116 @@ class LaunchError(Exception):
     pass
 
 
+ENV_TOKEN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def parse_launch_options(text):
+    """Steam-style launch options: ({env}, [command before the game], [arguments after it]).
+
+    'VAR=1 OTHER=2 gamescope -f -- %command% -vr' puts VAR/OTHER in the environment, gamescope in front of
+    the game and -vr after it. Without %command%, leading VAR=value words are the environment and the rest
+    are arguments, so plain '-windowed -nointro' still works."""
+    try:
+        words = shlex.split(text or "")
+    except ValueError as ex:
+        raise LaunchError(f"The launch options don't parse: {ex}")
+    env, pre, args = {}, [], []
+    if "%command%" in words:
+        i = words.index("%command%")
+        before, args = words[:i], [w for w in words[i + 1:] if w != "%command%"]
+        while before and ENV_TOKEN.match(before[0]):
+            k, v = before.pop(0).split("=", 1)
+            env[k] = v
+        pre = before
+    else:
+        while words and ENV_TOKEN.match(words[0]):
+            k, v = words.pop(0).split("=", 1)
+            env[k] = v
+        args = words
+    return env, pre, args
+
+
+XRIZER_DIRS = ["/opt/xrizer", "/usr/lib/xrizer", "/usr/share/xrizer", os.path.join(HOME, ".local/share/xrizer"),
+               "/opt/opencomposite", os.path.join(HOME, ".local/share/OpenComposite")]
+WIVRN_JSON = ["/usr/share/openxr/1/openxr_wivrn.json", "/usr/local/share/openxr/1/openxr_wivrn.json",
+              os.path.join(HOME, ".local/share/openxr/1/openxr_wivrn.json")]
+
+
+def config_home():
+    return os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+
+
+def xrizer_dir():
+    return next((d for d in XRIZER_DIRS if os.path.isfile(os.path.join(d, "bin/linux64/vrclient.so"))), "")
+
+
+def wivrn_running():
+    try:
+        return subprocess.run(["pgrep", "-x", "wivrn-server"], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode == 0
+    except OSError:
+        return False
+
+
+def start_wivrn():
+    """starts the WiVRn server (its systemd user unit, or the binary); True if it was started"""
+    if wivrn_running() or not which("wivrn-server"):
+        return False
+    env = host_env()
+    try:
+        has_unit = subprocess.run(["systemctl", "--user", "cat", "wivrn.service"], env=env,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        if has_unit and subprocess.run(["systemctl", "--user", "start", "wivrn.service"], env=env,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            return True
+        subprocess.Popen([which("wivrn-server")], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        return True
+    except OSError:
+        return False
+
+
+def vr_env(runner):
+    """environment for VR games: WiVRn's OpenXR runtime and xrizer for OpenVR games, as a fallback when WiVRn
+    hasn't set them as active (it does when a headset connects), and what Steam's container needs (umu)"""
+    env = {}
+    if not os.path.isfile(os.path.join(config_home(), "openxr/1/active_runtime.json")):
+        wj = next((j for j in WIVRN_JSON if os.path.isfile(j)), "")
+        if wj:
+            env["XR_RUNTIME_JSON"] = wj
+    if not os.path.isfile(os.path.join(config_home(), "openvr/openvrpaths.vrpath")):
+        xr = xrizer_dir()
+        if xr:
+            env["VR_OVERRIDE"] = xr
+    env["PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES"] = "1"
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    env["PRESSURE_VESSEL_FILESYSTEMS_RW"] = os.path.join(runtime, "wivrn/comp_ipc")
+    return env
+
+
+VR_LIBS = {"openvr_api.dll", "openxr_loader.dll", "xrsdkopenvr.dll", "unityopenxr.dll", "libopenvr_api.so",
+           "libopenxr_loader.so", "vrclient.dll", "openvr_api.so"}
+
+
+def looks_vr(exe):
+    """True when the program's folder ships OpenVR/OpenXR libraries"""
+    folder = os.path.dirname(exe)
+    if not os.path.isdir(folder) or folder in (HOME, "/"):
+        return False
+    base_depth = folder.count("/")
+    seen = 0
+    for dirpath, dirnames, filenames in os.walk(folder):
+        if dirpath.count("/") - base_depth >= 4:
+            dirnames[:] = []
+        for fn in filenames:
+            seen += 1
+            if fn.lower() in VR_LIBS:
+                return True
+        if seen > 30000:
+            break
+    return False
+
+
 def build_command(e, s=None, target=None, extra=None, tool=False):
     """(command, environment, working folder) to run the entry, or `target` inside its prefix"""
     s = s or settings()
@@ -403,10 +513,12 @@ def build_command(e, s=None, target=None, extra=None, tool=False):
     exe = os.path.expanduser(target or e["exe"]).strip()
     if not exe:
         raise LaunchError("No program set. Edit it and pick what to run.")
-    try:
-        args = extra if extra is not None else shlex.split(e["args"])
-    except ValueError as ex:
-        raise LaunchError(f"The arguments don't parse: {ex}")
+    opt_env, opt_pre, opt_args = parse_launch_options(e["args"])
+    if e["vr"]:
+        vr_opt = parse_launch_options(s["vr_options"])
+        opt_env = {**vr_opt[0], **opt_env}
+        opt_pre, opt_args = vr_opt[1] + opt_pre, vr_opt[2] + opt_args
+    args = extra if extra is not None else opt_args
     is_file = os.path.isfile(exe)
     cwd = os.path.expanduser(e["cwd"]) if e["cwd"] else (os.path.dirname(exe) if is_file else HOME)
     pre = []
@@ -467,16 +579,21 @@ def build_command(e, s=None, target=None, extra=None, tool=False):
         raise LaunchError(f"Unknown runner {runner}")
     if e["gamemode"] and which("gamemoderun"):
         pre.insert(0, "gamemoderun")
+    if extra is None:
+        pre = opt_pre + pre
     if e["wrapper"].strip():
         try:
             pre = shlex.split(e["wrapper"]) + pre
         except ValueError as ex:
             raise LaunchError(f"The command prefix doesn't parse: {ex}")
+    if e["vr"]:
+        env.update(vr_env(runner))
     for line in e["env"].splitlines():
         if "=" in line and not line.strip().startswith("#"):
             k, v = line.split("=", 1)
             if k.strip():
                 env[k.strip()] = v.strip()
+    env.update(opt_env)
     return pre + cmd, env, cwd if os.path.isdir(cwd) else HOME
 
 
@@ -1526,6 +1643,8 @@ class EditDialog(QDialog):
                 self.e.update(exe=exe, name=guess_name(exe),
                               runner=self.s["windows_runner"] if is_windows(exe) else "native")
             self.e.update(preset or {})
+            if self.e["exe"] and os.path.isfile(self.e["exe"]) and "vr" not in (preset or {}):
+                self.e["vr"] = looks_vr(self.e["exe"])
         self.cover_data = None
         self.cover_cleared = False
         self.icon_src = None
@@ -1608,8 +1727,11 @@ class EditDialog(QDialog):
         form.addRow("Runs", exerow)
 
         self.args = QLineEdit(self.e["args"])
-        self.args.setPlaceholderText("Optional, e.g. -windowed -nointro")
-        form.addRow("Arguments", self.args)
+        self.args.setPlaceholderText("Optional, like Steam: -windowed, or VAR=1 %command% -vr")
+        self.args.setToolTip("Works like Steam's launch options. Words after the game are arguments. With "
+                             "%command%, VAR=value words before it go into the environment and any other words "
+                             "run in front of the game (e.g. gamescope -f --).")
+        form.addRow("Launch options", self.args)
 
         rbox, self.runner_buttons = segments(RUNNER_NAMES, self.e["runner"], self.set_runner)
         rrow = QHBoxLayout()
@@ -1662,9 +1784,13 @@ class EditDialog(QDialog):
         self.favorite.setChecked(self.e["favorite"])
         self.nsfw = QCheckBox("NSFW")
         self.nsfw.setChecked(self.e["nsfw"])
+        self.vr = QCheckBox("VR game")
+        self.vr.setChecked(self.e["vr"])
+        self.vr.setToolTip("Sets up WiVRn (OpenXR) and xrizer (OpenVR) for it, starts the WiVRn server if it isn't "
+                           "running, and adds the VR launch options from Settings")
         self.hidden = QCheckBox("Hidden")
         self.hidden.setChecked(self.e["hidden"])
-        for i, cb in enumerate((self.mangohud, self.gamemode, self.favorite, self.nsfw, self.hidden)):
+        for i, cb in enumerate((self.vr, self.mangohud, self.gamemode, self.favorite, self.nsfw, self.hidden)):
             opts.addWidget(cb, i // 3, i % 3)
         form.addRow("Options", opts)
 
@@ -1738,6 +1864,8 @@ class EditDialog(QDialog):
             if is_windows(exe) and not self.e["icon"] and self.icon_src is None and not self.icon_cleared:
                 self.icon_src = ("exe", exe)
                 self.update_previews()
+            if self.new and not self.vr.isChecked() and looks_vr(exe):
+                self.vr.setChecked(True)
 
     def browse_prefix(self):
         path = QFileDialog.getExistingDirectory(self, "Choose the prefix folder",
@@ -1850,7 +1978,12 @@ class EditDialog(QDialog):
                 return QMessageBox.warning(self, "Program not found",
                                            f"{exe} isn't a file, and there's no command called {first or exe}.")
         e = self.e
-        e.update(name=name, exe=exe, args=self.args.text().strip(), runner=self.runner,
+        try:
+            parse_launch_options(self.args.text())
+        except LaunchError as ex:
+            self.args.setFocus()
+            return QMessageBox.warning(self, "Launch options", str(ex))
+        e.update(name=name, exe=exe, args=self.args.text().strip(), runner=self.runner, vr=self.vr.isChecked(),
                  kind=next(k for k, b in self.kind_buttons.items() if b.isChecked()),
                  version=(self.version.currentData() or "") if self.runner != "native" else "",
                  prefix=self.prefix.text().strip(), cwd=self.cwd.text().strip(),
@@ -2027,6 +2160,23 @@ class SettingsDialog(QDialog):
         grow2.addWidget(button("Browse…", self.browse_games))
         content.addRow("Dropped games go in", grow2)
 
+        vr = panel("VR (WiVRn)")
+        self.vr_options = QLineEdit(self.s["vr_options"])
+        self.vr_options.setPlaceholderText("Optional, e.g. PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES=1 %command%")
+        self.vr_options.setToolTip("Added to the launch options of every game marked VR (Steam syntax)")
+        vr.addRow("VR launch options", self.vr_options)
+        self.start_wivrn = QCheckBox("Start the WiVRn server before a VR game if it isn't running")
+        self.start_wivrn.setChecked(self.s["start_wivrn"])
+        self.start_wivrn.setEnabled(bool(which("wivrn-server")) or self.s["start_wivrn"])
+        vr.addRow("", self.start_wivrn)
+        xr = xrizer_dir()
+        wj = next((j for j in WIVRN_JSON if os.path.isfile(j)), "")
+        vr.addRow("", label("WiVRn: " + ("installed" if which("wivrn-server") else "not installed") +
+                            (", running" if wivrn_running() else "") +
+                            f" · OpenXR runtime: {'WiVRn' if wj else 'not found'}" +
+                            f" · OpenVR games: {'xrizer (' + xr + ')' if xr else 'no xrizer/OpenComposite found'}",
+                            "muted", wrap=True))
+
         covers = panel("Covers")
         self.sgdb = QLineEdit(self.s["sgdb_key"])
         self.sgdb.setPlaceholderText("Optional")
@@ -2038,7 +2188,7 @@ class SettingsDialog(QDialog):
         note.setOpenExternalLinks(False)
         note.linkActivated.connect(open_path)
         covers.addRow("", note)
-        v.addWidget(label(f"Hangar {VERSION} · library in {CONF_DIR}", "muted"))
+        v.addWidget(label(f"Hangar {VERSION} · library in {CONF_DIR}", "muted", wrap=True))
         v.addStretch(1)
 
         buttons = QDialogButtonBox()
@@ -2146,6 +2296,7 @@ class SettingsDialog(QDialog):
                       wine=self.wine.currentData() or "",
                       prefix_root=self.prefix_root.text().strip() or DEFAULT_SETTINGS["prefix_root"],
                       use_umu=self.use_umu.isChecked(), show_nsfw=self.show_nsfw.isChecked(),
+                      vr_options=self.vr_options.text().strip(), start_wivrn=self.start_wivrn.isChecked(),
                       blur_nsfw=self.blur_nsfw.isChecked(), sgdb_key=self.sgdb.text().strip(),
                       games_root=self.games_root.text().strip() or DEFAULT_SETTINGS["games_root"])
         self.accept()
@@ -2280,6 +2431,8 @@ class Card(EntryWidget):
         badges.addWidget(label(runner_label(e, win.s), "badgeAccent" if e["runner"] != "native" else "badge"))
         if e["nsfw"]:
             badges.addWidget(label("NSFW", "badgeNsfw"))
+        if e["vr"]:
+            badges.addWidget(label("VR", "badgeAccent"))
         if e["hidden"]:
             badges.addWidget(label("Hidden", "badge"))
         played = f"Played {human_time(e['playtime'])}" if e["playtime"] else (
@@ -2329,7 +2482,7 @@ class Tile(EntryWidget):
         texts = QVBoxLayout()
         texts.setSpacing(1)
         texts.addWidget(Elided(("★ " if e["favorite"] else "") + e["name"], "name"))
-        sub = runner_label(e, win.s)
+        sub = ("VR · " if e["vr"] else "") + runner_label(e, win.s)
         if e["playtime"]:
             sub += f" · {human_time(e['playtime'])}"
         texts.addWidget(Elided(sub, "muted"))
@@ -2508,7 +2661,7 @@ class Window(QMainWindow):
             return e["nsfw"]
         if e["nsfw"] and not self.s["show_nsfw"]:
             return False
-        return tab == "library" or (tab == "favorites" and e["favorite"])
+        return tab == "library" or (tab == "favorites" and e["favorite"]) or (tab == "vr" and e["vr"])
 
     def columns(self):
         w = SIZES.get(self.s["size"], 172)
@@ -2594,6 +2747,9 @@ class Window(QMainWindow):
             title = f"No {what} yet" if not any_kind else f"All your {what} are hidden or NSFW"
             text = (f"Add {what} you have outside Steam: Windows .exe files run through Proton or Wine, "
                     "native programs and AppImages run as they are. You can also drop files on this window.")
+        elif s["tab"] == "vr":
+            title, text = "No VR games", "Tick “VR game” in a game's settings; games that ship VR libraries " \
+                                         "get it ticked when you add them."
         elif s["tab"] == "favorites":
             title, text = "No favourites", f"Mark {what} as favourite from their ⋯ menu."
         elif s["tab"] == "nsfw":
@@ -2848,10 +3004,14 @@ class Window(QMainWindow):
             self.launcher.stop(e)
             self.say(f"Stopping {e['name']}…")
             return
+        started_wivrn = e["vr"] and self.s["start_wivrn"] and start_wivrn()
         try:
             self.launcher.launch(e)
         except (LaunchError, OSError) as ex:
             QMessageBox.warning(self, f"Can't start {e['name']}", str(ex))
+            return
+        if started_wivrn:
+            self.say(f"Started the WiVRn server for {e['name']}: connect your headset.", 15)
             return
         first = e["runner"] != "native" and not os.path.isdir(os.path.join(wine_prefix(e), "drive_c"))
         self.say(f"Starting {e['name']}…" + (" (the first start sets up its prefix, that takes a minute)"
@@ -3024,6 +3184,8 @@ def cli_launch(eid):
     if not e:
         print(f"hangar: no entry {eid}", file=sys.stderr)
         return 1
+    if e["vr"] and settings()["start_wivrn"]:
+        start_wivrn()
     try:
         p = start_process(e)
     except (LaunchError, OSError) as ex:
@@ -3049,6 +3211,8 @@ def cli_check():
     print(f"Proton ({len(pv)}): " + (", ".join(v["name"] for v in pv) or "none") + f"\n  default: {default_proton() or '-'}")
     wv = wine_versions()
     print(f"Wine ({len(wv)}): " + (", ".join(v["name"] for v in wv) or "none"))
+    print(f"VR: WiVRn {'running' if wivrn_running() else ('installed' if which('wivrn-server') else 'not installed')}"
+          f", xrizer {xrizer_dir() or 'not found'}")
     for tool in ("umu-run", "winetricks", "mangohud", "gamemoderun", "gamescope"):
         print(f"{tool}: {which(tool) or 'not found'}")
     try:
