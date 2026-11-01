@@ -12,13 +12,13 @@ A launcher for the games and apps you have outside Steam, for Linux.
 - **Wayland windows:** Proton games run in GE-Proton's Wayland mode by default (Settings), so they move between monitors properly (VR games stay on X11: Proton's VR bridge needs it); one game can opt out with `PROTON_ENABLE_WAYLAND=0` in its Environment.
 - **Per game:** its own prefix, start folder, environment variables, a command prefix (`gamescope -f --`), MangoHud and GameMode. Prefix tools: winecfg, regedit, winetricks (downloadable from Settings), running another `.exe` in the prefix, stopping it.
 - **Drop to add:** drop a `.zip`/`.rar`/`.7z`/`.tar` archive and it's unpacked into your games folder (`~/Games/<Name>`, changeable) and the Add dialog opens with the main program already picked. Drop a folder to copy or move it there (or use it in place). Drop an installer (`setup.exe`) to run it in a new prefix; when it finishes, Hangar finds what it installed. Drop files on a game to put them in its folder (mods, patches), unpacking archives into it if you like; a single image sets the cover. RAR, 7z and the rest unpack with the bundled bsdtar, or the system's unrar/7z when it has them.
-- Playtime and last played, sorting, search, the last launch log, app-menu shortcuts, and drag and drop of program files to add them.
+- Playtime and last played, sorting, search, the last launch log, app-menu and desktop shortcuts (⋯ menu, or Make shortcut in the edit window), and drag and drop of program files to add them.
 
 ## Get it
 
 Download `Hangar-x86_64.AppImage` from the latest release, `chmod +x` it and run it. Without the AppImage: `pip install PyQt6 certifi` and run `./hangar.py`.
 
-`hangar --check` prints the Proton/Wine versions and tools Hangar finds. `hangar --launch ID` runs one entry without the window (menu shortcuts use it).
+`hangar --check` prints the Proton/Wine versions and tools Hangar finds. `hangar --launch ID` runs one entry without the window (menu and desktop shortcuts use it).
 
 ## How Proton runs
 

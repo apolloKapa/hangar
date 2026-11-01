@@ -872,27 +872,102 @@ def self_command():
     return [sys.executable, os.path.abspath(__file__)]
 
 
-def shortcut_path(e):
+def desktop_dir():
+    """the user's desktop folder (XDG_DESKTOP_DIR from user-dirs.dirs, else ~/Desktop)"""
+    try:
+        with open(os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"),
+                               "user-dirs.dirs"), encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("XDG_DESKTOP_DIR="):
+                    path = line.split("=", 1)[1].strip().strip('"').replace("$HOME", HOME)
+                    if path and os.path.abspath(path) != HOME:
+                        return path
+    except OSError:
+        pass
+    return os.path.join(HOME, "Desktop")
+
+
+def desktop_shortcut_path(e):
+    """the desktop file for this entry; found by its X-Hangar-Id so a renamed entry keeps its file"""
+    folder = desktop_dir()
+    try:
+        for fn in os.listdir(folder):
+            if fn.endswith(".desktop"):
+                try:
+                    with open(os.path.join(folder, fn), encoding="utf-8", errors="replace") as f:
+                        if f"\nX-Hangar-Id={e['id']}\n" in f.read(4096):
+                            return os.path.join(folder, fn)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return None
+
+
+def shortcut_path(e, where="menu"):
+    if where == "desktop":
+        return desktop_shortcut_path(e) or ""
     return os.path.join(MENU_DIR, f"hangar-{e['id']}.desktop")
 
 
-def make_shortcut(e):
+def has_shortcut(e, where="menu"):
+    path = shortcut_path(e, where)
+    return bool(path) and os.path.exists(path)
+
+
+def shortcut_text(e):
     icon = os.path.join(ICONS, e["icon"]) if e["icon"] else (os.path.join(COVERS, e["cover"]) if e["cover"] else "")
     name = e["name"].replace("\n", " ")
-    os.makedirs(MENU_DIR, exist_ok=True)
-    with open(shortcut_path(e), "w", encoding="utf-8") as f:
-        f.write("[Desktop Entry]\nType=Application\n"
-                f"Name={name}\nComment=Run with Hangar\n"
-                f"Exec={shlex.join(self_command() + ['--launch', e['id']])}\n"
-                f"Icon={icon or 'applications-games'}\nTerminal=false\n"
-                f"Categories={'Game;' if e['kind'] == 'game' else 'Utility;'}\n")
+    return ("[Desktop Entry]\nType=Application\n"
+            f"Name={name}\nComment=Run with Hangar\n"
+            f"Exec={shlex.join(self_command() + ['--launch', e['id']])}\n"
+            f"Icon={icon or 'applications-games'}\nTerminal=false\n"
+            f"Categories={'Game;' if e['kind'] == 'game' else 'Utility;'}\n"
+            f"X-Hangar-Id={e['id']}\n")
 
 
-def remove_shortcut(e):
-    try:
-        os.remove(shortcut_path(e))
-    except OSError:
-        pass
+def make_shortcut(e, where="menu"):
+    if where == "menu":
+        os.makedirs(MENU_DIR, exist_ok=True)
+        with open(shortcut_path(e), "w", encoding="utf-8") as f:
+            f.write(shortcut_text(e))
+        return
+    folder = desktop_dir()
+    os.makedirs(folder, exist_ok=True)
+    stem = re.sub(r'[/\\:*?"<>|\x00-\x1f]', "", e["name"].replace("\n", " ")).strip(" .") or "Game"
+    old = desktop_shortcut_path(e)
+    path = os.path.join(folder, stem + ".desktop")
+    n = 2
+    while os.path.exists(path) and path != old:
+        path = os.path.join(folder, f"{stem} ({n}).desktop")
+        n += 1
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(shortcut_text(e))
+    os.chmod(path, 0o755)
+    if old and old != path:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    if shutil.which("gio"):  # Nautilus/Nemo only run desktop files marked trusted
+        subprocess.run(["gio", "set", path, "metadata::trusted", "true"], env=host_env(),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def remove_shortcut(e, where="menu"):
+    path = shortcut_path(e, where)
+    if path:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def refresh_shortcuts(e):
+    """rewrite whichever shortcuts this entry already has (after a rename, new icon, kind change)"""
+    for where in ("menu", "desktop"):
+        if has_shortcut(e, where):
+            make_shortcut(e, where)
 
 
 # ---- .exe icons --------------------------------------------------------------------------------
@@ -1691,6 +1766,16 @@ class EditDialog(QDialog):
         iconrow.addWidget(ib)
         iconrow.addStretch(1)
         left.addLayout(iconrow)
+        left.addSpacing(10)
+        sl = QLabel("Make shortcut")
+        sl.setObjectName("muted")
+        left.addWidget(sl)
+        self.desktop_btn = button("", self.toggle_desktop,
+                                  tip="A launcher for this on your desktop; it's made or removed when you save")
+        self.desktop_btn.setCheckable(True)
+        self.desktop_btn.setChecked(not self.new and has_shortcut(self.e, "desktop"))
+        self.toggle_desktop()
+        left.addWidget(self.desktop_btn)
         left.addStretch(1)
         body.addLayout(left)
 
@@ -1809,6 +1894,10 @@ class EditDialog(QDialog):
 
         self.set_runner(self.e["runner"], initial=True)
         self.update_previews()
+
+    def toggle_desktop(self):
+        # the button is checkable, so a click has already flipped it; only the label changes here
+        self.desktop_btn.setText("On the desktop ✓" if self.desktop_btn.isChecked() else "Add to desktop")
 
     # runner
     def set_runner(self, runner, initial=False):
@@ -2026,8 +2115,13 @@ class EditDialog(QDialog):
         if e["icon"] != old_icon:
             remove_file(ICONS, old_icon)
         put_entry(e)
-        if os.path.exists(shortcut_path(e)):
-            make_shortcut(e)
+        refresh_shortcuts(e)
+        want = self.desktop_btn.isChecked()
+        if want != has_shortcut(e, "desktop"):
+            try:
+                make_shortcut(e, "desktop") if want else remove_shortcut(e, "desktop")
+            except OSError as ex:
+                QMessageBox.warning(self, "Hangar", f"Couldn't make the desktop shortcut: {ex}")
         self.accept()
 
 
@@ -2362,8 +2456,11 @@ def entry_menu(win, e, parent):
     m.addAction("Unhide" if e["hidden"] else "Hide", lambda: win.mark(e["id"], hidden=not e["hidden"]))
     other = "app" if e["kind"] == "game" else "game"
     m.addAction(f"Move to {KINDS[other]}", lambda: win.mark(e["id"], kind=other))
-    has = os.path.exists(shortcut_path(e))
+    has = has_shortcut(e)
     m.addAction("Remove from app menu" if has else "Add to app menu", lambda: win.toggle_shortcut(e["id"]))
+    has = has_shortcut(e, "desktop")
+    m.addAction("Remove desktop shortcut" if has else "Make a desktop shortcut",
+                lambda: win.toggle_shortcut(e["id"], "desktop"))
     m.addSeparator()
     m.addAction("Remove…", lambda: win.remove(e["id"]))
     return m
@@ -3040,8 +3137,8 @@ class Window(QMainWindow):
 
     def mark(self, eid, **changes):
         e = update_entry(eid, **changes)
-        if e and "kind" in changes and os.path.exists(shortcut_path(e)):
-            make_shortcut(e)
+        if e and "kind" in changes:
+            refresh_shortcuts(e)
         self.refresh()
 
     def remove(self, eid):
@@ -3066,6 +3163,7 @@ class Window(QMainWindow):
             self.launcher.stop(e)
         remove_entry(eid)
         remove_shortcut(e)
+        remove_shortcut(e, "desktop")
         remove_file(COVERS, e["cover"])
         remove_file(ICONS, e["icon"])
         if cb and cb.isChecked() and os.path.isdir(pfx) and pfx not in (HOME, "/") and \
@@ -3074,16 +3172,20 @@ class Window(QMainWindow):
         self.refresh()
         self.say(f"Removed {e['name']}.")
 
-    def toggle_shortcut(self, eid):
+    def toggle_shortcut(self, eid, where="menu"):
         e = get_entry(eid)
         if not e:
             return
-        if os.path.exists(shortcut_path(e)):
-            remove_shortcut(e)
-            self.say(f"Removed {e['name']} from the app menu.")
-        else:
-            make_shortcut(e)
-            self.say(f"{e['name']} is in the app menu now.")
+        place = "the app menu" if where == "menu" else "the desktop"
+        if has_shortcut(e, where):
+            remove_shortcut(e, where)
+            self.say(f"Removed {e['name']} from {place}.")
+            return
+        try:
+            make_shortcut(e, where)
+        except OSError as ex:
+            return self.say(f"Couldn't make the shortcut: {ex}")
+        self.say(f"{e['name']} is on {place} now." if where == "desktop" else f"{e['name']} is in the app menu now.")
 
     def set_cover_file(self, eid, path):
         try:
