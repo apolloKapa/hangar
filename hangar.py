@@ -506,6 +506,18 @@ def looks_vr(exe):
     return False
 
 
+def focused_output():
+    """the name of the monitor that has focus (niri), or "" """
+    if not os.environ.get("NIRI_SOCKET") or not which("niri"):
+        return ""
+    try:
+        out = subprocess.run(["niri", "msg", "-j", "focused-output"], capture_output=True, text=True, timeout=2,
+                             env=host_env())
+        return (json.loads(out.stdout) or {}).get("name", "") if out.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ""
+
+
 def build_command(e, s=None, target=None, extra=None, tool=False):
     """(command, environment, working folder) to run the entry, or `target` inside its prefix"""
     s = s or settings()
@@ -567,6 +579,11 @@ def build_command(e, s=None, target=None, extra=None, tool=False):
             # a native Wayland window: X11 windows get lost on monitors at negative positions (niri). Not for VR
             # games: Proton's OpenVR/DXVK bridge needs X11 (D3D11 fails to create its device otherwise)
             env["PROTON_ENABLE_WAYLAND"] = "1"
+            # Wine takes the topmost monitor as the main one, so fullscreen games jumped to it: make the main
+            # one the monitor you launch from (GE-Proton's Wayland driver reads this; the game's own env wins)
+            focused = focused_output()
+            if focused:
+                env.setdefault("WAYLANDDRV_PRIMARY_MONITOR", focused)
     elif runner == "wine":
         wine = runner_path(e, s)
         if not wine:
