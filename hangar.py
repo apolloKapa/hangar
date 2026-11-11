@@ -13,6 +13,9 @@ files where they are.
 
   hangar                 open the window
   hangar --launch ID     run one entry without the window (used by menu shortcuts)
+  hangar FILE.exe        open a Windows program (or --open FILE): a small window to run it, pick
+                         Proton/Wine and optionally add it to the library, like PortProton
+  hangar --run FILE      run a program right away with the default runner, no window
   hangar --check         list the Proton/Wine versions and tools Hangar finds
 """
 import hashlib
@@ -39,7 +42,7 @@ from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDialog
                              QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
                              QScrollArea, QSizePolicy, QToolButton, QVBoxLayout, QWidget)
 
-VERSION = "1.3.1"
+VERSION = "1.5.0"
 HOME = os.path.expanduser("~")
 CONF_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "hangar")
 DATA = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local/share"), "hangar")
@@ -94,6 +97,7 @@ DEFAULT_SETTINGS = {
     "sort": "name", "proton": "", "wine": "", "windows_runner": "proton",
     "prefix_root": os.path.join(HOME, "Games", "Hangar", "prefixes"), "use_umu": True,
     "show_nsfw": False, "blur_nsfw": True, "sgdb_key": "", "vr_options": "", "start_wivrn": True, "wayland": True, "games_root": os.path.join(HOME, "Games"),
+    "exe_opener": False,
 }
 
 
@@ -881,6 +885,73 @@ def game_folder(e):
 
 # ---- menu shortcuts ----------------------------------------------------------------------------
 
+# ---- opening programs from the file manager ---------------------------------------------------------
+# Windows programs' MIME types: Hangar can be the app that opens them (double-click an .exe and it runs)
+EXE_MIMES = ["application/x-ms-dos-executable", "application/x-msdownload", "application/x-msi",
+             "application/x-ms-shortcut", "application/vnd.microsoft.portable-executable", "application/x-dosexec",
+             "application/x-ms-ne-executable", "application/x-bat", "application/x-msdos-program"]
+OPENER = os.path.join(MENU_DIR, "hangar-open.desktop")
+
+
+def entry_for_path(path):
+    """the library entry that runs this file, if there is one"""
+    real = os.path.realpath(path)
+    for e in library():
+        exe = os.path.expanduser(e["exe"] or "")
+        if exe and os.path.realpath(exe) == real:
+            return e
+    return None
+
+
+def quick_entry(path, s=None):
+    """an entry for running a file once: its library entry if it has one, else a new one (not saved)
+    whose prefix is the one it would get in the library, so its saves are there if you add it later"""
+    s = s or settings()
+    e = entry_for_path(path)
+    if e:
+        return e, True
+    e = dict(ENTRY_DEFAULTS)
+    e.update(id="quick-" + hashlib.md5(os.path.realpath(path).encode()).hexdigest()[:10], name=guess_name(path),
+             exe=path, runner=(s.get("windows_runner") or "proton") if is_windows(path) else "native",
+             added=int(time.time()))
+    return e, False
+
+
+def register_opener(on):
+    """Hangar opens Windows programs (or stops doing so): a hidden menu entry for their MIME types,
+    made the default for them"""
+    if on:
+        os.makedirs(MENU_DIR, exist_ok=True)
+        with open(OPENER, "w", encoding="utf-8") as f:
+            f.write("[Desktop Entry]\nType=Application\nName=Hangar\nGenericName=Run with Hangar\n"
+                    "Comment=Run this Windows program with Proton or Wine\n"
+                    f"Exec={shlex.join(self_command() + ['--open'])} %f\n"
+                    "Icon=hangar\nTerminal=false\nNoDisplay=true\nStartupWMClass=hangar\n"
+                    f"MimeType={';'.join(EXE_MIMES)};\n")
+        if which("xdg-mime"):
+            subprocess.run(["xdg-mime", "default", os.path.basename(OPENER)] + EXE_MIMES, env=host_env(),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    else:
+        try:
+            os.remove(OPENER)
+        except OSError:
+            pass
+        # take it back out of mimeapps.list, so the type falls back to whatever else opens it
+        mimeapps = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "mimeapps.list")
+        try:
+            with open(mimeapps, encoding="utf-8") as f:
+                lines = f.readlines()
+            keep = [ln for ln in lines if not (ln.split("=", 1)[0].strip() in EXE_MIMES and os.path.basename(OPENER) in ln)]
+            if keep != lines:
+                with open(mimeapps, "w", encoding="utf-8") as f:
+                    f.writelines(keep)
+        except OSError:
+            pass
+    if which("update-desktop-database"):
+        subprocess.run(["update-desktop-database", MENU_DIR], env=host_env(),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
 def self_command():
     if APPIMAGE:
         return [APPIMAGE]
@@ -1334,6 +1405,7 @@ QMainWindow, QDialog, #root {{ background: {t['bg']}; }}
 QLabel {{ color: {t['text']}; }}
 QLabel#muted {{ color: {t['muted']}; }}
 QLabel#title {{ font-size: 22px; font-weight: 700; }}
+QLineEdit#title {{ font-size: 18px; font-weight: 700; background: transparent; border: none; padding: 0; }}
 QLabel#h2 {{ font-size: 15px; font-weight: 700; }}
 QLabel#name {{ font-weight: 600; }}
 QLabel#badge {{ background: {t['surface2']}; color: {t['muted']}; border-radius: 7px; padding: 2px 8px; font-size: 11px; }}
@@ -1709,6 +1781,8 @@ class CoverSearch(QDialog):
             except Exception:
                 pass
         self.data = data
+        if self.exe_opener.isChecked() != self.s["exe_opener"]:
+            register_opener(self.exe_opener.isChecked())
         self.accept()
 
     def done(self, r):
@@ -2254,6 +2328,12 @@ class SettingsDialog(QDialog):
                                 "main one. For one game, put PROTON_ENABLE_WAYLAND=0 in its Environment to turn it "
                                 "off.")
         run.addRow("", self.wayland)
+        self.exe_opener = QCheckBox("Open .exe files with Hangar (double-click one to run it)")
+        self.exe_opener.setChecked(self.s["exe_opener"])
+        self.exe_opener.setToolTip("Hangar becomes the app for Windows programs: opening one from your file manager "
+                                   "shows a small window to run it with Proton or Wine, and add it to the library "
+                                   "if you like.")
+        run.addRow("", self.exe_opener)
         self.use_umu = QCheckBox("Use umu-launcher for Proton" + ("" if umu else " (not installed)"))
         self.use_umu.setChecked(self.s["use_umu"])
         self.use_umu.setToolTip("umu runs Proton inside Steam's runtime, like Steam does. Without it, Proton runs "
@@ -2419,7 +2499,7 @@ class SettingsDialog(QDialog):
                       prefix_root=self.prefix_root.text().strip() or DEFAULT_SETTINGS["prefix_root"],
                       use_umu=self.use_umu.isChecked(), show_nsfw=self.show_nsfw.isChecked(),
                       vr_options=self.vr_options.text().strip(), start_wivrn=self.start_wivrn.isChecked(),
-                      wayland=self.wayland.isChecked(),
+                      wayland=self.wayland.isChecked(), exe_opener=self.exe_opener.isChecked(),
                       blur_nsfw=self.blur_nsfw.isChecked(), sgdb_key=self.sgdb.text().strip(),
                       games_root=self.games_root.text().strip() or DEFAULT_SETTINGS["games_root"])
         self.accept()
@@ -3310,6 +3390,151 @@ class Window(QMainWindow):
 
 # ---- main --------------------------------------------------------------------------------------
 
+class QuickRun(QDialog):
+    """opening a program with Hangar (from the file manager, or `hangar FILE.exe`): its icon and name,
+    what runs it, and Run. It can go into the library too; a program already there runs as set up"""
+
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+        self.s = settings()
+        self.e, self.known = quick_entry(path, self.s)
+        self.setWindowTitle(f"Run {os.path.basename(path)}")
+        self.setMinimumWidth(500)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(22, 22, 22, 18)
+        lay.setSpacing(14)
+
+        top = QHBoxLayout()
+        top.setSpacing(16)
+        pic = QLabel()
+        pic.setFixedSize(72, 72)
+        pm = QPixmap()
+        data = exe_icon(path) if is_windows(path) else None
+        if data and pm.loadFromData(data) and not pm.isNull():
+            pic.setPixmap(rounded(pm, 72, 72, 14, fit=True))
+        else:
+            pic.setPixmap(placeholder(self.e["name"], 72, 72, r=14))
+        top.addWidget(pic, 0, Qt.AlignmentFlag.AlignTop)
+        col = QVBoxLayout()
+        col.setSpacing(4)
+        self.name = QLineEdit(self.e["name"])
+        self.name.setObjectName("title")
+        self.name.setReadOnly(self.known)
+        col.addWidget(self.name)
+        where = label(path.replace(HOME, "~", 1), "muted", wrap=True)
+        col.addWidget(where)
+        if self.known:
+            col.addWidget(label("In your library: runs with its own settings", "muted"))
+        top.addLayout(col, 1)
+        lay.addLayout(top)
+
+        form = QFormLayout()
+        form.setHorizontalSpacing(14)
+        self.runner = QComboBox()
+        if is_windows(path):
+            for v in proton_versions():
+                self.runner.addItem(f"Proton: {v['name']}", ("proton", v["path"]))
+            for v in wine_versions():
+                self.runner.addItem(f"Wine: {v['name']}", ("wine", v["path"]))
+        self.runner.addItem("Native (run it as a Linux program)", ("native", ""))
+        # what it's set to (its library entry), else the default Proton/Wine
+        want = (self.e["runner"], self.e["version"] or (default_proton(self.s) if self.e["runner"] == "proton"
+                                                         else default_wine(self.s) if self.e["runner"] == "wine" else ""))
+        for i in range(self.runner.count()):
+            r, v = self.runner.itemData(i)
+            if r == want[0] and (not want[1] or v == want[1] or r == "native"):
+                self.runner.setCurrentIndex(i)
+                break
+        self.runner.setEnabled(not self.known)
+        form.addRow("Run with", self.runner)
+        opts = QHBoxLayout()
+        self.mangohud = QCheckBox("MangoHud")
+        self.mangohud.setChecked(self.e["mangohud"])
+        self.gamemode = QCheckBox("GameMode")
+        self.gamemode.setChecked(self.e["gamemode"])
+        for c in (self.mangohud, self.gamemode):
+            c.setEnabled(not self.known)
+            opts.addWidget(c)
+        opts.addStretch(1)
+        form.addRow("", opts)
+        self.keep = QCheckBox("Add it to my library")
+        self.keep.setVisible(not self.known)
+        form.addRow("", self.keep)
+        lay.addLayout(form)
+        if is_windows(path) and is_installer(path) and not self.known:
+            lay.addWidget(label("This looks like an installer: Install runs it in a new prefix and adds the game "
+                                "it installs to your library.", "muted", wrap=True))
+
+        row = QHBoxLayout()
+        row.addWidget(button("Open folder", lambda: open_path(os.path.dirname(path))))
+        row.addStretch(1)
+        row.addWidget(button("Cancel", self.reject))
+        if is_windows(path) and is_installer(path) and not self.known:
+            row.addWidget(button("Install", self.install))
+        go = button("Run", self.run, "primary")
+        go.setDefault(True)
+        row.addWidget(go)
+        lay.addLayout(row)
+
+    def chosen(self):
+        e = dict(self.e)
+        if not self.known:
+            r, v = self.runner.currentData()
+            e.update(name=self.name.text().strip() or self.e["name"], runner=r, version=v,
+                     mangohud=self.mangohud.isChecked(), gamemode=self.gamemode.isChecked())
+        return e
+
+    def run(self):
+        e = self.chosen()
+        try:
+            if self.known or self.keep.isChecked():
+                if not self.known:
+                    e["id"] = new_id()
+                    e["icon"] = save_exe_icon(e["id"], self.path) if is_windows(self.path) else ""
+                    put_entry(e)
+                # through --launch: it keeps the playtime, like a menu shortcut
+                subprocess.Popen(self_command() + ["--launch", e["id"]], env=os.environ.copy(),
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+            else:
+                start_process(e, self.s, log_name="quick")
+        except (LaunchError, OSError) as ex:
+            QMessageBox.warning(self, "Can't run it", str(ex))
+            return
+        self.accept()
+
+    def install(self):
+        """the installer goes through the main window, which finds the installed game and adds it"""
+        self.accept()
+        w = Window()
+        w.show()
+        QTimer.singleShot(200, lambda: w.run_installer(self.path, guess_name(self.path)))
+        QuickRun.keep_alive = w
+
+
+def cli_run(path):
+    """`hangar --run FILE`: runs it right away (its library entry if it has one), no window"""
+    if not os.path.isfile(path):
+        print(f"hangar: no such file {path}", file=sys.stderr)
+        return 1
+    e, known = quick_entry(path)
+    if known:
+        return cli_launch(e["id"])
+    try:
+        p = start_process(e, log_name="quick")
+    except (LaunchError, OSError) as ex:
+        print(f"hangar: can't run {path}: {ex}", file=sys.stderr)
+        subprocess.run(["notify-send", "-a", "Hangar", f"Can't run {os.path.basename(path)}", str(ex)], env=host_env(),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        return 1
+    try:
+        return p.wait()
+    except KeyboardInterrupt:
+        kill_group(p, signal.SIGTERM)
+        return p.wait()
+
+
 def cli_launch(eid):
     e = get_entry(eid)
     if not e:
@@ -3360,6 +3585,8 @@ def main():
         sys.exit(cli_check())
     if len(sys.argv) >= 3 and sys.argv[1] == "--launch":
         sys.exit(cli_launch(sys.argv[2]))
+    if len(sys.argv) >= 3 and sys.argv[1] == "--run":
+        sys.exit(cli_run(os.path.abspath(os.path.expanduser(sys.argv[2]))))
     if len(sys.argv) >= 2 and sys.argv[1] in ("-h", "--help"):
         print(__doc__)
         return
@@ -3372,9 +3599,23 @@ def main():
     if os.path.exists(ICON):
         app.setWindowIcon(QIcon(ICON))
     apply_theme(app)
+    # keep the file manager's "open with" pointing at this copy (an AppImage that moved, a new version)
+    if settings()["exe_opener"]:
+        try:
+            register_opener(True)
+        except OSError:
+            pass
+    args = [a for a in sys.argv[1:] if a != "--open"]
+    paths = [os.path.abspath(a) for a in args if os.path.exists(a)]
+    # one program opened from the file manager (or `hangar FILE.exe`): the small run window, PortProton-style
+    if len(paths) == 1 and os.path.isfile(paths[0]) and not is_archive(paths[0]) \
+            and (is_windows(paths[0]) or "--open" in sys.argv):
+        d = QuickRun(paths[0])
+        d.show()
+        app.setQuitOnLastWindowClosed(True)
+        sys.exit(app.exec())
     w = Window()
     w.show()
-    paths = [os.path.abspath(a) for a in sys.argv[1:] if os.path.exists(a)]
     if paths:
         QTimer.singleShot(200, lambda: w.import_paths(paths))
     sys.exit(app.exec())

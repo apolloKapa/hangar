@@ -92,6 +92,7 @@ Terminal=false
 Categories=Game;
 Keywords=games;launcher;proton;wine;ge-proton;exe;
 StartupWMClass=hangar
+MimeType=application/x-ms-dos-executable;application/x-msdownload;application/x-msi;application/x-ms-shortcut;application/vnd.microsoft.portable-executable;application/x-dosexec;application/x-bat;application/x-msdos-program;
 X-AppImage-Version=$VERSION
 DESK
 cp "$APPDIR/hangar.desktop" "$APPDIR/usr/share/applications/hangar.desktop"
