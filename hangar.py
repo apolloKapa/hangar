@@ -42,7 +42,7 @@ from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDialog
                              QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
                              QScrollArea, QSizePolicy, QToolButton, QVBoxLayout, QWidget)
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 HOME = os.path.expanduser("~")
 CONF_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "hangar")
 DATA = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local/share"), "hangar")
@@ -3466,6 +3466,7 @@ class QuickRun(QDialog):
             lay.addWidget(label("This looks like an installer: Install runs it in a new prefix and adds the game "
                                 "it installs to your library.", "muted", wrap=True))
 
+        lay.addStretch(1)
         row = QHBoxLayout()
         row.addWidget(button("Open folder", lambda: open_path(os.path.dirname(path))))
         row.addStretch(1)
@@ -3476,6 +3477,15 @@ class QuickRun(QDialog):
         go.setDefault(True)
         row.addWidget(go)
         lay.addLayout(row)
+
+    def showEvent(self, ev):
+        # a small window of its own size: tiling compositors (niri) float fixed-size windows instead of
+        # stretching them to the screen's height
+        if not getattr(self, "_sized", False):
+            self._sized = True
+            self.adjustSize()
+            self.setFixedSize(max(500, self.sizeHint().width()), self.sizeHint().height())
+        super().showEvent(ev)
 
     def chosen(self):
         e = dict(self.e)
