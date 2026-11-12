@@ -44,7 +44,7 @@ from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDialog
                              QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
                              QScrollArea, QSizePolicy, QSystemTrayIcon, QToolButton, QVBoxLayout, QWidget)
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 HOME = os.path.expanduser("~")
 CONF_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "hangar")
 DATA = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local/share"), "hangar")
@@ -787,8 +787,129 @@ def is_archive(path):
     return bool(ARCHIVE_RE.search(path)) and not LATER_PART_RE.search(path)
 
 
+# an installer's own messages in its string table: two different ones are needed (a game's own strings can
+# say "installer", French for "install": PlayRDR2.exe's "veuillez réinstaller le jeu")
+INSTALLER_PHRASES = (r"\bInstalling\b", r"setup wizard", r"installation wizard", r"license agreement",
+                     r"destination (folder|directory|location)", r"select (a|the) (location|folder) (to|where)",
+                     r"\bready to install\b", r"\binstallation (is )?complete")
+INSTALLER_STRINGS_RE = re.compile("|".join(f"({p})" for p in INSTALLER_PHRASES), re.I)
+
+
+def installer_phrase_count(text):
+    return len({i for m in INSTALLER_STRINGS_RE.finditer(text) for i, g in enumerate(m.groups()) if g})
+INSTALLER_TEXT_RE = re.compile(r"\b(setup|installer|install|installation)\b", re.I)
+# what installer builders leave in the file: NSIS's manifest name, Inno's data block, InstallShield's name
+INSTALLER_MARKS = (b"Nullsoft.NSIS.exehead", b"Inno Setup Setup Data", b"InstallShield")
+_installer_cache = {}
+
+
+def pe_sections_and_version(path):
+    """(section names, version-info text, string-table text) of a Windows .exe: its header, RT_VERSION and
+    RT_STRING resources"""
+    with open(path, "rb") as f:
+        head = f.read(4096)
+        if head[:2] != b"MZ":
+            return [], "", ""
+        pe = struct.unpack_from("<I", head, 0x3C)[0]
+        f.seek(pe)
+        hdr = f.read(24 + 240 + 40 * 96)
+        if hdr[:4] != b"PE\0\0":
+            return [], "", ""
+        nsec, = struct.unpack_from("<H", hdr, 6)
+        opt_size, = struct.unpack_from("<H", hdr, 20)
+        magic, = struct.unpack_from("<H", hdr, 24)
+        dd = 24 + (96 if magic == 0x10B else 112)
+        res_rva, _res_size = struct.unpack_from("<II", hdr, dd + 16)
+        sections, names = [], []
+        for i in range(min(nsec, 96)):
+            o = 24 + opt_size + 40 * i
+            if o + 40 > len(hdr):
+                break
+            names.append(hdr[o:o + 8].rstrip(b"\0").decode("latin-1"))
+            vsize, vaddr, rawsize, rawptr = struct.unpack_from("<IIII", hdr, o + 8)
+            sections.append((vaddr, max(vsize, rawsize), rawptr))
+        text = strings = ""
+
+        def at(off, n):
+            f.seek(off)
+            b = f.read(n)
+            if len(b) != n:
+                raise ValueError("short read")
+            return b
+
+        def off_of(rva):
+            for va, size, raw in sections:
+                if va <= rva < va + size:
+                    return raw + rva - va
+            raise ValueError("rva outside sections")
+
+        if res_rva:
+            base = off_of(res_rva)  # read on demand: installers keep their whole payload in .rsrc
+
+            def entries(rel):
+                named, ids = struct.unpack("<HH", at(base + rel + 12, 4))
+                return [struct.unpack("<II", at(base + rel + 16 + 8 * i, 8)) for i in range(min(named + ids, 512))]
+
+            def leaves(node, depth=0, out=None):
+                out = [] if out is None else out
+                if len(out) >= 64:
+                    return out
+                if node & 0x80000000:
+                    if depth < 3:
+                        for _n, sub in entries(node & 0x7FFFFFFF):
+                            leaves(sub, depth + 1, out)
+                else:
+                    out.append(struct.unpack("<II", at(base + node, 8)))
+                return out
+
+            for name, off in entries(0):
+                if name == 16 and off & 0x80000000:  # RT_VERSION: the first language's is enough
+                    for rva, size in leaves(off)[:1]:
+                        text = at(off_of(rva), min(size, 64 << 10)).decode("utf-16-le", "ignore")
+                elif name == 6 and off & 0x80000000:  # RT_STRING: every language, capped
+                    got = []
+                    for rva, size in leaves(off):
+                        got.append(at(off_of(rva), min(size, 64 << 10)).decode("utf-16-le", "ignore"))
+                        if sum(map(len, got)) > 256 << 10:
+                            break
+                    strings = "\n".join(got)
+        return names, text, strings
+
+
+def installer_by_content(path):
+    """True when the .exe says it's an installer: WiX Burn's section, version info calling it a setup or
+    installer (Rockstar-Games-Launcher.exe: "Rockstar Games Launcher Installer"), or an installer builder's marks"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    key = (path, st.st_size, st.st_mtime)
+    if key in _installer_cache:
+        return _installer_cache[key]
+    found = False
+    try:
+        names, text, strings = pe_sections_and_version(path)
+        if any(n.lower() == ".wixburn" for n in names):
+            found = True
+        else:
+            # the values of FileDescription / ProductName / InternalName / OriginalFilename
+            fields = re.findall(r"(?:FileDescription|ProductName|InternalName|OriginalFilename)\x00+([^\x00]+)", text)
+            found = any(INSTALLER_TEXT_RE.search(v) for v in fields) or installer_phrase_count(strings) >= 2
+        if not found:
+            with open(path, "rb") as f:
+                blob = f.read(2 << 20)
+            found = any(m in blob for m in INSTALLER_MARKS)
+    except (OSError, struct.error, ValueError, IndexError):
+        found = False
+    _installer_cache[key] = found
+    return found
+
+
 def is_installer(path):
-    return bool(INSTALLER_RE.search(os.path.basename(path)))
+    """an installer by its name (setup.exe, install_x.exe, x-setup.exe) or, for a real .exe file, by its contents"""
+    if INSTALLER_RE.search(os.path.basename(path)):
+        return True
+    return path.lower().endswith(".exe") and os.path.isabs(path) and os.path.isfile(path) and installer_by_content(path)
 
 
 def archive_name(path):
