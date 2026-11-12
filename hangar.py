@@ -42,7 +42,7 @@ from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDialog
                              QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
                              QScrollArea, QSizePolicy, QToolButton, QVBoxLayout, QWidget)
 
-VERSION = "1.5.2"
+VERSION = "1.6.0"
 HOME = os.path.expanduser("~")
 CONF_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "hangar")
 DATA = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local/share"), "hangar")
@@ -62,6 +62,8 @@ STEAM_ROOTS = [os.path.join(HOME, ".steam/root"), os.path.join(HOME, ".local/sha
                os.path.join(HOME, ".steam/steam"),
                os.path.join(HOME, ".var/app/com.valvesoftware.Steam/.local/share/Steam")]
 GE_RELEASES = "https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest"
+HANGAR_RELEASES = "https://api.github.com/repos/apolloKapa/hangar/releases/latest"
+HANGAR_PAGE = "https://github.com/apolloKapa/hangar/releases/latest"
 DW_RELEASES = "https://dawn.wine/api/v1/repos/dawn-winery/dwproton/releases/latest"
 # Protons Hangar can download: key -> (label, latest-release API, archive suffix)
 PROTON_SOURCES = {"ge": ("GE-Proton", GE_RELEASES, ".tar.gz"), "dw": ("DWProton", DW_RELEASES, ".tar.xz")}
@@ -955,6 +957,13 @@ def register_opener(on):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
 
+def restart_hangar():
+    """starts a fresh Hangar (the updated AppImage) and quits this one"""
+    subprocess.Popen(self_command(), env=os.environ.copy(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    QApplication.quit()
+
+
 def self_command():
     if APPIMAGE:
         return [APPIMAGE]
@@ -1280,6 +1289,57 @@ def install_proton(source, report):
         except OSError:
             pass
     return tag
+
+
+def version_tuple(v):
+    return tuple(int(n) for n in re.findall(r"\d+", v)[:3])
+
+
+def check_update(_report=None):
+    """the newest Hangar release on GitHub: {version, newer, url (the AppImage), page}"""
+    rel = http_json(HANGAR_RELEASES)
+    ver = rel["tag_name"].lstrip("v")
+    asset = next((a for a in rel.get("assets", []) if a["name"].endswith(".AppImage")), None)
+    return {"version": ver, "newer": version_tuple(ver) > version_tuple(VERSION),
+            "url": asset["browser_download_url"] if asset else "", "size": asset["size"] if asset else 0,
+            "page": rel.get("html_url") or HANGAR_PAGE}
+
+
+def install_update(info, report):
+    """downloads the release's AppImage over the running one (beside it first, then swapped in); returns the version"""
+    if not APPIMAGE or not os.path.isfile(APPIMAGE):
+        raise RuntimeError("Hangar isn't running from its AppImage")
+    folder = os.path.dirname(APPIMAGE)
+    if not os.access(folder, os.W_OK):
+        raise RuntimeError(f"can't write to {folder}")
+    part = os.path.join(folder, f".{os.path.basename(APPIMAGE)}.part")
+    req = urllib.request.Request(info["url"], headers={"User-Agent": f"Hangar/{VERSION}"})
+    global SSL
+    SSL = SSL or ssl_context()
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=SSL) as r, open(part, "wb") as f:
+            total = int(r.headers.get("Content-Length") or info["size"] or 0)
+            done = 0
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                report(("download", done, total, info["version"]))
+        with open(part, "rb") as f:
+            if f.read(4) != b"\x7fELF":
+                raise RuntimeError("the download isn't an AppImage")
+        if total and os.path.getsize(part) != total:
+            raise RuntimeError("the download is incomplete; try again")
+        os.chmod(part, 0o755)
+        os.replace(part, APPIMAGE)  # a new file, so the running copy keeps working until restart
+    finally:
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+    return info["version"]
 
 
 def install_winetricks(_report):
@@ -2398,7 +2458,21 @@ class SettingsDialog(QDialog):
         note.setOpenExternalLinks(False)
         note.linkActivated.connect(open_path)
         covers.addRow("", note)
-        v.addWidget(label(f"Hangar {VERSION} · library in {CONF_DIR}", "muted", wrap=True))
+        urow = QHBoxLayout()
+        urow.addWidget(label(f"Hangar {VERSION} · library in {CONF_DIR}", "muted", wrap=True), 1)
+        self.update_btn = button("Check for updates", self.check_updates)
+        urow.addWidget(self.update_btn)
+        v.addLayout(urow)
+        self.update_bar = QProgressBar()
+        self.update_bar.setFixedHeight(10)
+        self.update_bar.hide()
+        v.addWidget(self.update_bar)
+        self.update_note = label("", "muted", wrap=True)
+        self.update_note.setOpenExternalLinks(False)
+        self.update_note.linkActivated.connect(open_path)
+        self.update_note.hide()
+        v.addWidget(self.update_note)
+        self.update_info = None
         v.addStretch(1)
 
         buttons = QDialogButtonBox()
@@ -2478,6 +2552,61 @@ class SettingsDialog(QDialog):
         elif stage == "extract":
             self.ge_bar.setRange(0, 0)
             self.ge_note.setText(f"Unpacking {tag}…")
+
+    def update_say(self, text):
+        self.update_note.setText(text)
+        self.update_note.show()
+
+    def check_updates(self):
+        if self.update_info and self.update_info.get("ready"):
+            return restart_hangar()
+        if self.update_info and self.update_info["newer"] and self.update_info["url"] and APPIMAGE:
+            return self.download_update()
+        self.update_btn.setEnabled(False)
+        self.update_say("Checking GitHub…")
+        self.update_task = Task(check_update, self)
+        self.update_task.done.connect(self.update_checked)
+        self.update_task.start()
+
+    def update_checked(self, info, error):
+        self.update_btn.setEnabled(True)
+        if error:
+            return self.update_say(f"Couldn't check for updates: {error}")
+        self.update_info = info
+        page = f'<a href="{info["page"]}">release page</a>'
+        if not info["newer"]:
+            return self.update_say(f"Hangar {VERSION} is the newest version.")
+        if info["url"] and APPIMAGE:
+            self.update_btn.setText(f"Update to {info['version']}")
+            self.update_say(f"Hangar {info['version']} is out ({page}).")
+        else:
+            self.update_say(f"Hangar {info['version']} is out: get it from the {page}.")
+
+    def download_update(self):
+        self.update_btn.setEnabled(False)
+        self.update_bar.show()
+        self.update_bar.setRange(0, 0)
+        info = self.update_info
+        self.update_task = Task(lambda report: install_update(info, report), self)
+        self.update_task.progress.connect(self.update_progress)
+        self.update_task.done.connect(self.update_done)
+        self.update_task.start()
+
+    def update_progress(self, p):
+        _stage, done, total, ver = p
+        if total:
+            self.update_bar.setRange(0, 1000)
+            self.update_bar.setValue(int(done * 1000 / total))
+        self.update_say(f"Downloading Hangar {ver}: {done >> 20} / {total >> 20} MB")
+
+    def update_done(self, ver, error):
+        self.update_btn.setEnabled(True)
+        self.update_bar.hide()
+        if error:
+            return self.update_say(f"Couldn't update: {error}")
+        self.update_info["ready"] = True
+        self.update_btn.setText("Restart Hangar")
+        self.update_say(f"Hangar {ver} is installed. Restart Hangar to use it (unsaved settings here are lost).")
 
     def proton_done(self, source, tag, error):
         self.ge_btn.setEnabled(True)

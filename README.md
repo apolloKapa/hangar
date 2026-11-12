@@ -17,7 +17,7 @@ A launcher for the games and apps you have outside Steam, for Linux.
 
 ## Get it
 
-Download `Hangar-x86_64.AppImage` from the latest release, `chmod +x` it and run it. Without the AppImage: `pip install PyQt6 certifi` and run `./hangar.py`.
+Download `Hangar-x86_64.AppImage` from the latest release, `chmod +x` it and run it. Without the AppImage: `pip install PyQt6 certifi` and run `./hangar.py`. To update later, use **Check for updates** at the bottom of Settings: it downloads the newest release over the AppImage and restarts Hangar.
 
 `hangar --check` prints the Proton/Wine versions and tools Hangar finds. `hangar --launch ID` runs one entry without the window (menu and desktop shortcuts use it). `hangar FILE.exe` opens the run window for a program; `hangar --run FILE` runs it without one.
 
