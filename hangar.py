@@ -26,6 +26,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import ssl
 import struct
 import subprocess
@@ -35,13 +36,13 @@ import urllib.parse
 import urllib.request
 import uuid
 
-from PyQt6.QtCore import QRectF, QSize, Qt, QThread, QTimer, QObject, pyqtSignal
+from PyQt6.QtCore import QRectF, QSize, QSocketNotifier, Qt, QThread, QTimer, QObject, pyqtSignal
 from PyQt6.QtGui import (QColor, QFont, QFontMetrics, QIcon, QImage, QKeySequence, QLinearGradient, QPainter,
                          QPainterPath, QPalette, QPixmap, QShortcut)
 from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDialog, QComboBox, QDialog,
                              QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLabel,
                              QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
-                             QScrollArea, QSizePolicy, QToolButton, QVBoxLayout, QWidget)
+                             QScrollArea, QSizePolicy, QSystemTrayIcon, QToolButton, QVBoxLayout, QWidget)
 
 VERSION = "1.7.0"
 HOME = os.path.expanduser("~")
@@ -103,7 +104,7 @@ DEFAULT_SETTINGS = {
     "sort": "name", "proton": "", "wine": "", "windows_runner": "proton",
     "prefix_root": os.path.join(HOME, "Games", "Hangar", "prefixes"), "use_umu": True,
     "show_nsfw": False, "blur_nsfw": True, "sgdb_key": "", "vr_options": "", "start_wivrn": True, "wayland": True, "games_root": os.path.join(HOME, "Games"),
-    "exe_opener": False,
+    "exe_opener": False, "close_to_tray": True,
 }
 
 
@@ -1040,6 +1041,8 @@ def register_opener(on):
 
 def restart_hangar():
     """starts a fresh Hangar (the updated AppImage) and quits this one"""
+    if INSTANCE:  # let the new one become the running Hangar instead of handing over to this one
+        INSTANCE.close()
     subprocess.Popen(self_command(), env=os.environ.copy(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)
     QApplication.quit()
@@ -2464,6 +2467,13 @@ class SettingsDialog(QDialog):
             self.size.addItem(k.capitalize(), k)
         self.size.setCurrentIndex(self.size.findData(self.s["size"]))
         look.addRow("Grid covers", self.size)
+        self.close_to_tray = QCheckBox("Closing the window keeps Hangar running in the tray")
+        self.close_to_tray.setChecked(self.s["close_to_tray"])
+        tray_ok = QSystemTrayIcon.isSystemTrayAvailable()
+        self.close_to_tray.setToolTip("The X hides Hangar to the system tray (click its icon there to open it again, "
+                                      "or right-click → Quit). " + ("" if tray_ok else
+                                                                   "No system tray was found, so the X quits for now."))
+        look.addRow("", self.close_to_tray)
 
         # running
         run = panel("Running Windows programs")
@@ -2751,6 +2761,7 @@ class SettingsDialog(QDialog):
                       use_umu=self.use_umu.isChecked(), show_nsfw=self.show_nsfw.isChecked(),
                       vr_options=self.vr_options.text().strip(), start_wivrn=self.start_wivrn.isChecked(),
                       wayland=self.wayland.isChecked(), exe_opener=self.exe_opener.isChecked(),
+                      close_to_tray=self.close_to_tray.isChecked(),
                       blur_nsfw=self.blur_nsfw.isChecked(), sgdb_key=self.sgdb.text().strip(),
                       games_root=self.games_root.text().strip() or DEFAULT_SETTINGS["games_root"])
         self.accept()
@@ -3626,7 +3637,55 @@ class Window(QMainWindow):
         e.acceptProposedAction()
         QTimer.singleShot(0, lambda: self.import_paths(paths))
 
+    # ---- tray
+    def tray_icon(self):
+        if getattr(self, "tray", None) is None:
+            icon = QApplication.instance().windowIcon()
+            if icon.isNull():
+                icon = QIcon(placeholder("Hangar", 64, 64))
+            self.tray = QSystemTrayIcon(icon, self)
+            self.tray.setToolTip("Hangar")
+            menu = QMenu(self)
+            menu.addAction("Open Hangar", self.show_window)
+            menu.addSeparator()
+            menu.addAction("Quit Hangar", self.quit_hangar)
+            self.tray.setContextMenu(menu)
+            self.tray.activated.connect(self.tray_clicked)
+        return self.tray
+
+    def tray_clicked(self, reason):
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+            if self.isVisible() and not self.isMinimized():
+                self.hide()
+            else:
+                self.show_window()
+
+    def show_window(self):
+        self.show()
+        self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
+        self.raise_()
+        self.activateWindow()
+
+    def quit_hangar(self):
+        self.quitting = True
+        if self.close():
+            QApplication.quit()
+        else:
+            self.quitting = False
+
     def closeEvent(self, e):
+        if not getattr(self, "quitting", False) and settings()["close_to_tray"] \
+                and QSystemTrayIcon.isSystemTrayAvailable():
+            tray = self.tray_icon()
+            tray.show()
+            self.hide()
+            e.ignore()
+            if not getattr(self, "told_tray", False):
+                self.told_tray = True
+                tray.showMessage("Hangar is still running", "It's in the tray: click the icon to open it again, "
+                                 "or right-click → Quit Hangar. (Settings can turn this off.)",
+                                 QSystemTrayIcon.MessageIcon.Information, 5000)
+            return
         if self.launcher.running:
             names = ", ".join(get_entry(i)["name"] for i in self.launcher.running if get_entry(i))
             r = QMessageBox.question(self, "Still running",
@@ -3636,7 +3695,10 @@ class Window(QMainWindow):
                 e.ignore()
                 return
             self.launcher.save_running()
+        if getattr(self, "tray", None) is not None:
+            self.tray.hide()
         super().closeEvent(e)
+        QApplication.quit()  # quitOnLastWindowClosed is off (the tray keeps it alive), so quit here
 
 
 # ---- main --------------------------------------------------------------------------------------
@@ -3841,6 +3903,84 @@ def cli_check():
     return 0
 
 
+INSTANCE = None
+INSTANCE_SOCKET = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/hangar-{os.getuid()}", "hangar.sock")
+
+
+def hand_over(paths):
+    """True when another Hangar is running: it was told to show itself (and to import `paths`)"""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+            c.settimeout(1)
+            c.connect(INSTANCE_SOCKET)
+            c.sendall((json.dumps({"show": True, "paths": paths}) + "\n").encode())
+        return True
+    except OSError:
+        return False
+
+
+class InstanceServer(QObject):
+    """a Unix socket other Hangar starts talk to (Qt's QLocalServer would pull QtNetwork into the AppImage)"""
+
+    def __init__(self, win):
+        super().__init__(win)
+        self.win = win
+        os.makedirs(os.path.dirname(INSTANCE_SOCKET), exist_ok=True)
+        try:
+            os.remove(INSTANCE_SOCKET)  # nobody answered on it (hand_over failed), so it's left from a crash
+        except OSError:
+            pass
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.bind(INSTANCE_SOCKET)
+        os.chmod(INSTANCE_SOCKET, 0o600)
+        self.sock.listen(4)
+        self.sock.setblocking(False)
+        self.notifier = QSocketNotifier(self.sock.fileno(), QSocketNotifier.Type.Read, self)
+        self.notifier.activated.connect(self.incoming)
+
+    def incoming(self, *_):
+        try:
+            conn, _ = self.sock.accept()
+        except OSError:
+            return
+        data = b""
+        try:
+            conn.settimeout(1)
+            while not data.endswith(b"\n") and len(data) < 1 << 20:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        except OSError:
+            pass
+        finally:
+            conn.close()
+        try:
+            msg = json.loads(data.decode() or "{}")
+        except ValueError:
+            msg = {}
+        self.win.show_window()
+        paths = [p for p in msg.get("paths") or [] if isinstance(p, str) and os.path.exists(p)]
+        if paths:
+            QTimer.singleShot(100, lambda: self.win.import_paths(paths))
+
+    def close(self):
+        self.notifier.setEnabled(False)
+        self.sock.close()
+        try:
+            os.remove(INSTANCE_SOCKET)
+        except OSError:
+            pass
+
+
+def listen(win):
+    global INSTANCE
+    try:
+        INSTANCE = InstanceServer(win)
+    except OSError:
+        INSTANCE = None
+
+
 def main():
     if len(sys.argv) >= 2 and sys.argv[1] == "--check":
         sys.exit(cli_check())
@@ -3875,7 +4015,14 @@ def main():
         d.show()
         app.setQuitOnLastWindowClosed(True)
         sys.exit(app.exec())
+    # one Hangar at a time: starting it again (menu, dock, file manager) brings back the running one,
+    # which may be hidden in the tray, and hands it the files
+    if hand_over(paths):
+        return
+    app.setQuitOnLastWindowClosed(False)
     w = Window()
+    listen(w)
+    app.aboutToQuit.connect(lambda: INSTANCE and INSTANCE.close())
     w.show()
     if paths:
         QTimer.singleShot(200, lambda: w.import_paths(paths))
