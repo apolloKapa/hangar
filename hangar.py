@@ -42,7 +42,7 @@ from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDialog
                              QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
                              QScrollArea, QSizePolicy, QToolButton, QVBoxLayout, QWidget)
 
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 HOME = os.path.expanduser("~")
 CONF_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "hangar")
 DATA = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local/share"), "hangar")
@@ -62,6 +62,9 @@ STEAM_ROOTS = [os.path.join(HOME, ".steam/root"), os.path.join(HOME, ".local/sha
                os.path.join(HOME, ".steam/steam"),
                os.path.join(HOME, ".var/app/com.valvesoftware.Steam/.local/share/Steam")]
 GE_RELEASES = "https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest"
+DW_RELEASES = "https://dawn.wine/api/v1/repos/dawn-winery/dwproton/releases/latest"
+# Protons Hangar can download: key -> (label, latest-release API, archive suffix)
+PROTON_SOURCES = {"ge": ("GE-Proton", GE_RELEASES, ".tar.gz"), "dw": ("DWProton", DW_RELEASES, ".tar.xz")}
 WINETRICKS_URL = "https://raw.githubusercontent.com/Winetricks/winetricks/master/src/winetricks"
 KINDS = {"game": "Games", "app": "Apps"}
 TABS = {"library": "Library", "favorites": "Favourites", "vr": "VR", "nsfw": "NSFW", "hidden": "Hidden"}
@@ -1232,16 +1235,18 @@ def save_cover(eid, data):
     return name
 
 
-def install_ge_proton(report):
-    """downloads the newest GE-Proton into compatibilitytools.d; returns its name"""
-    rel = http_json(GE_RELEASES)
-    tag = rel["tag_name"]
-    dest = proton_install_dir()
-    if os.path.isfile(os.path.join(dest, tag, "proton")):
-        return tag
-    asset = next((a for a in rel["assets"] if a["name"].endswith(".tar.gz")), None)
+def install_proton(source, report):
+    """downloads the newest release of a PROTON_SOURCES Proton into compatibilitytools.d; returns its name"""
+    _label, api, suffix = PROTON_SOURCES[source]
+    rel = http_json(api)
+    asset = next((a for a in rel["assets"] if a["name"].endswith(suffix)), None)
     if not asset:
-        raise RuntimeError("the release has no .tar.gz")
+        raise RuntimeError(f"the release has no {suffix}")
+    folder = asset["name"][:-len(suffix)]  # the archive's top folder: GE-Proton10-34, dwproton-11.0-16-x86_64
+    tag = folder.replace("-x86_64", "")  # the name proton_versions() shows
+    dest = proton_install_dir()
+    if os.path.isfile(os.path.join(dest, folder, "proton")):
+        return tag
     sums = next((a for a in rel["assets"] if a["name"].endswith(".sha512sum")), None)
     expected = ""
     if sums:
@@ -1267,7 +1272,7 @@ def install_ge_proton(report):
         if expected and digest.hexdigest() != expected:
             raise RuntimeError("the download is damaged (checksum mismatch); try again")
         report(("extract", 0, 0, tag))
-        subprocess.run(["tar", "-xzf", part, "-C", dest], env=host_env(), check=True,
+        subprocess.run(["tar", "-xf", part, "-C", dest], env=host_env(), check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     finally:
         try:
@@ -2303,8 +2308,11 @@ class SettingsDialog(QDialog):
         self.proton = QComboBox()
         run.addRow("Default Proton", self.proton)
         grow = QHBoxLayout()
-        self.ge_btn = button("Get the newest GE-Proton", self.get_ge)
+        self.ge_btn = button("Get the newest GE-Proton", lambda: self.get_proton("ge"))
         grow.addWidget(self.ge_btn)
+        self.dw_btn = button("Get the newest DWProton", lambda: self.get_proton("dw"))
+        self.dw_btn.setToolTip("DWProton (An Anime Team, built on Proton-CachyOS): fixes for anime games")
+        grow.addWidget(self.dw_btn)
         self.ge_bar = QProgressBar()
         self.ge_bar.setFixedHeight(10)
         self.ge_bar.hide()
@@ -2450,14 +2458,15 @@ class SettingsDialog(QDialog):
         if path:
             self.prefix_root.setText(path)
 
-    def get_ge(self):
+    def get_proton(self, source):
         self.ge_btn.setEnabled(False)
+        self.dw_btn.setEnabled(False)
         self.ge_bar.show()
         self.ge_bar.setRange(0, 0)
         self.ge_note.setText("Looking for the newest release…")
-        self.task = Task(install_ge_proton, self)
+        self.task = Task(lambda report: install_proton(source, report), self)
         self.task.progress.connect(self.ge_progress)
-        self.task.done.connect(self.ge_done)
+        self.task.done.connect(lambda tag, error: self.proton_done(source, tag, error))
         self.task.start()
 
     def ge_progress(self, info):
@@ -2470,11 +2479,17 @@ class SettingsDialog(QDialog):
             self.ge_bar.setRange(0, 0)
             self.ge_note.setText(f"Unpacking {tag}…")
 
-    def ge_done(self, tag, error):
+    def proton_done(self, source, tag, error):
         self.ge_btn.setEnabled(True)
+        self.dw_btn.setEnabled(True)
         self.ge_bar.hide()
         if error:
-            self.ge_note.setText(f"Couldn't get GE-Proton: {error}")
+            self.ge_note.setText(f"Couldn't get {PROTON_SOURCES[source][0]}: {error}")
+            return
+        if source != "ge":  # only GE-Proton becomes the default; others are picked per game (or here)
+            self.fill_runners()
+            self.ge_note.setText(f"{tag} is installed: pick it for a game in its Proton version list, "
+                                 "or as the default above.")
             return
         self.ge_note.setText(f"{tag} is installed and is now the default.")
         self.s["proton"] = ""

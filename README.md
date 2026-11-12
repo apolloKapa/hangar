@@ -3,7 +3,7 @@
 A launcher for the games and apps you have outside Steam, for Linux.
 
 - **Anything runs:** Windows `.exe`/`.msi`/`.bat` files through **Proton** (the newest GE-Proton by default) or **Wine**, and native programs, AppImages, scripts or plain commands (`flatpak run …`) as they are.
-- **Pick the version per game:** every Proton on the PC is found (Steam's own, GE-Proton in `compatibilitytools.d`, Heroic's, Hangar's), and every Wine (system, Lutris, Heroic, Bottles runners). Settings has a button that downloads the newest GE-Proton, checksum-checked.
+- **Pick the version per game:** every Proton on the PC is found (Steam's own, GE-Proton in `compatibilitytools.d`, Heroic's, Hangar's), and every Wine (system, Lutris, Heroic, Bottles runners). Settings has buttons that download the newest GE-Proton or DWProton (An Anime Team's Proton-CachyOS fork with fixes for anime games), checksum-checked.
 - **Games and Apps tabs,** each with **Library, Favourites, NSFW and Hidden** lists. NSFW entries only show in their own tab (unless you turn that off) and their covers are blurred elsewhere. Hidden entries only show under Hidden.
 - **Grid of covers or a list.** Covers come from the Steam store or SteamGridDB (free API key, for games that aren't on Steam), or any image: pick one or drop it on the tile. Windows programs get their `.exe` icon automatically.
 - **Themes:** Midnight, Gold, Tokyo Night, Catppuccin, Dracula, Rosé Pine, Nord, Gruvbox, Emerald, Crimson, OLED and Light, with any accent colour. Three grid sizes.
@@ -30,7 +30,7 @@ With [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher) instal
 - `~/.config/hangar/library.json` and `settings.json`
 - `~/.local/share/hangar/`: covers, icons, launch logs, downloaded tools
 - `~/Games/Hangar/prefixes/` (changeable): prefixes of new Windows entries
-- GE-Proton downloads go into Steam's `compatibilitytools.d`, so Steam can use them too
+- GE-Proton and DWProton downloads go into Steam's `compatibilitytools.d`, so Steam can use them too
 
 ## Building
 
