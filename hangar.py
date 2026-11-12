@@ -43,7 +43,7 @@ from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDialog
                              QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
                              QScrollArea, QSizePolicy, QToolButton, QVBoxLayout, QWidget)
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 HOME = os.path.expanduser("~")
 CONF_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "hangar")
 DATA = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local/share"), "hangar")
@@ -122,7 +122,7 @@ def save_settings(**changes):
 ENTRY_DEFAULTS = {
     "id": "", "name": "", "kind": "game", "exe": "", "args": "", "cwd": "", "runner": "native", "version": "",
     "prefix": "", "env": "", "wrapper": "", "mangohud": False, "gamemode": False, "favorite": False,
-    "nsfw": False, "hidden": False, "vr": False, "cover": "", "icon": "", "added": 0, "last_played": 0, "playtime": 0,
+    "nsfw": False, "hidden": False, "vr": False, "eac": False, "battleye": False, "cover": "", "icon": "", "added": 0, "last_played": 0, "playtime": 0,
 }
 
 
@@ -515,6 +515,46 @@ VR_LIBS = {"openvr_api.dll", "openxr_loader.dll", "xrsdkopenvr.dll", "unityopenx
            "libopenxr_loader.so", "vrclient.dll", "openvr_api.so"}
 
 
+# Steam's free anti-cheat runtimes: Proton's Wine loads the Linux side of EAC/BattlEye from the folder in
+# PROTON_EAC_RUNTIME / PROTON_BATTLEYE_RUNTIME. key -> (label, env var, Steam app id, folder names)
+ANTICHEATS = {
+    "eac": ("EasyAntiCheat", "PROTON_EAC_RUNTIME", 1826330, ("Proton EasyAntiCheat Runtime", "eac_runtime")),
+    "battleye": ("BattlEye", "PROTON_BATTLEYE_RUNTIME", 1161040, ("Proton BattlEye Runtime", "battleye_runtime")),
+}
+
+
+def anticheat_runtime(key):
+    """the installed runtime folder for an ANTICHEATS key ('' if none): Steam's, then Heroic's"""
+    names = ANTICHEATS[key][3]
+    dirs = [os.path.join(lib, "steamapps", "common", names[0]) for lib in steam_libraries()]
+    for heroic in (os.path.join(HOME, ".config/heroic"), os.path.join(HOME, ".var/app/com.heroicgameslauncher.hgl/config/heroic")):
+        dirs.append(os.path.join(heroic, "tools", "runtimes", names[1]))
+    return next((d for d in dirs if os.path.isdir(d) and os.listdir(d)), "")
+
+
+def looks_anticheat(exe):
+    """{"eac": bool, "battleye": bool}: what the program's folder ships"""
+    out = {"eac": False, "battleye": False}
+    folder = os.path.dirname(exe)
+    if not os.path.isdir(folder) or folder in (HOME, "/"):
+        return out
+    base_depth = folder.count("/")
+    seen = 0
+    for dirpath, dirnames, filenames in os.walk(folder):
+        if dirpath.count("/") - base_depth >= 3:
+            dirnames[:] = []
+        for n in dirnames + filenames:
+            low = n.lower()
+            seen += 1
+            if low == "easyanticheat" or low.startswith(("easyanticheat_", "start_protected_game")):
+                out["eac"] = True
+            if low == "battleye" or low.startswith(("beservice", "beclient")):
+                out["battleye"] = True
+        if seen > 5000 or all(out.values()):
+            break
+    return out
+
+
 def looks_vr(exe):
     """True when the program's folder ships OpenVR/OpenXR libraries"""
     folder = os.path.dirname(exe)
@@ -544,6 +584,26 @@ def focused_output():
         return (json.loads(out.stdout) or {}).get("name", "") if out.returncode == 0 else ""
     except (OSError, subprocess.SubprocessError, ValueError):
         return ""
+
+
+def anticheat_env(e, env):
+    """PROTON_EAC_RUNTIME / PROTON_BATTLEYE_RUNTIME for the anti-cheats the entry has turned on"""
+    out = {}
+    shared = []
+    for key, (label, var, appid, _names) in ANTICHEATS.items():
+        if not e.get(key):
+            continue
+        path = anticheat_runtime(key)
+        if not path:
+            raise LaunchError(f"{e['name']} needs the Proton {label} Runtime. It's free: install it from Steam "
+                              f"(search \"Proton {label} Runtime\" with Tools shown in the library, or open "
+                              f"steam://install/{appid}), or turn {label} off in the game's settings.")
+        out[var] = path
+        shared.append(path)
+    if shared:  # umu's Steam Runtime container only sees home by default; a Steam library elsewhere must be shared
+        old = env.get("PRESSURE_VESSEL_FILESYSTEMS_RO", "")
+        out["PRESSURE_VESSEL_FILESYSTEMS_RO"] = ":".join([p for p in old.split(":") if p] + shared)
+    return out
 
 
 def build_command(e, s=None, target=None, extra=None, tool=False):
@@ -603,6 +663,7 @@ def build_command(e, s=None, target=None, extra=None, tool=False):
             cmd = [os.path.join(proton, "proton"), "run" if tool else "waitforexitandrun"] + run
         if e["mangohud"]:
             env["MANGOHUD"] = "1"
+        env.update(anticheat_env(e, env))
         if s["wayland"] and not e["vr"] and os.environ.get("WAYLAND_DISPLAY"):
             # a native Wayland window: X11 windows get lost on monitors at negative positions (niri). Not for VR
             # games: Proton's OpenVR/DXVK bridge needs X11 (D3D11 fails to create its device otherwise)
@@ -624,6 +685,7 @@ def build_command(e, s=None, target=None, extra=None, tool=False):
         cmd = [wine] + windows_cmd(exe) + args
         if e["mangohud"]:
             env["MANGOHUD"] = "1"
+        env.update(anticheat_env(e, env))  # only Proton-based Wine builds (GE/soda) read these
     else:
         raise LaunchError(f"Unknown runner {runner}")
     if e["gamemode"] and which("gamemoderun"):
@@ -1904,6 +1966,9 @@ class EditDialog(QDialog):
             self.e.update(preset or {})
             if self.e["exe"] and os.path.isfile(self.e["exe"]) and "vr" not in (preset or {}):
                 self.e["vr"] = looks_vr(self.e["exe"])
+            if self.e["exe"] and os.path.isfile(self.e["exe"]) and is_windows(self.e["exe"]) \
+                    and "eac" not in (preset or {}):
+                self.e.update(looks_anticheat(self.e["exe"]))
         self.cover_data = None
         self.cover_cleared = False
         self.icon_src = None
@@ -2059,7 +2124,17 @@ class EditDialog(QDialog):
                            "running, and adds the VR launch options from Settings")
         self.hidden = QCheckBox("Hidden")
         self.hidden.setChecked(self.e["hidden"])
-        for i, cb in enumerate((self.vr, self.mangohud, self.gamemode, self.favorite, self.nsfw, self.hidden)):
+        self.eac = QCheckBox("EasyAntiCheat")
+        self.battleye = QCheckBox("BattlEye")
+        for key, cb in (("eac", self.eac), ("battleye", self.battleye)):
+            label_, _var, appid, _names = ANTICHEATS[key]
+            cb.setChecked(self.e[key])
+            have = anticheat_runtime(key)
+            cb.setToolTip(f"Loads Steam's Proton {label_} Runtime, for games whose {label_} supports Linux "
+                          "(Proton/Wine only). " + (f"Found: {have}" if have else
+                                                    f"Not installed yet: get it free from Steam (steam://install/{appid})"))
+        for i, cb in enumerate((self.vr, self.mangohud, self.gamemode, self.favorite, self.nsfw, self.hidden,
+                                self.eac, self.battleye)):
             opts.addWidget(cb, i // 3, i % 3)
         form.addRow("Options", opts)
 
@@ -2086,6 +2161,9 @@ class EditDialog(QDialog):
         windows = runner != "native"
         for w in (self.version, self.version_label, self.prefix_box, self.prefix_label):
             w.setVisible(windows)
+        for cb in (getattr(self, "eac", None), getattr(self, "battleye", None)):
+            if cb is not None:
+                cb.setEnabled(windows)
         self.version.clear()
         if runner == "proton":
             vs = proton_versions()
@@ -2139,6 +2217,10 @@ class EditDialog(QDialog):
                 self.update_previews()
             if self.new and not self.vr.isChecked() and looks_vr(exe):
                 self.vr.setChecked(True)
+            if self.new and is_windows(exe):
+                found = looks_anticheat(exe)
+                self.eac.setChecked(self.eac.isChecked() or found["eac"])
+                self.battleye.setChecked(self.battleye.isChecked() or found["battleye"])
 
     def browse_prefix(self):
         path = QFileDialog.getExistingDirectory(self, "Choose the prefix folder",
@@ -2262,6 +2344,7 @@ class EditDialog(QDialog):
                  prefix=self.prefix.text().strip(), cwd=self.cwd.text().strip(),
                  wrapper=self.wrapper.text().strip(), env=self.env.toPlainText().strip(),
                  mangohud=self.mangohud.isChecked(), gamemode=self.gamemode.isChecked(),
+                 eac=self.eac.isChecked(), battleye=self.battleye.isChecked(),
                  favorite=self.favorite.isChecked(), nsfw=self.nsfw.isChecked(), hidden=self.hidden.isChecked())
         if self.runner != "native" and not e["prefix"]:
             # fixed at creation, so renaming it or changing the prefixes folder later keeps its saves
