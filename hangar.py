@@ -21,6 +21,7 @@ files where they are.
 import hashlib
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -257,6 +258,22 @@ def steam_libraries():
     return libs
 
 
+ARCHES = ("x86_64", "aarch64")
+MACHINE = {"amd64": "x86_64", "arm64": "aarch64"}.get(platform.machine().lower(), platform.machine().lower())
+
+
+def arch_of(name):
+    """the CPU a Proton build/archive name says it's for ("" when it doesn't say)"""
+    low = name.lower()
+    return next((a for a in ARCHES if a in low), "")
+
+
+def proton_label(name):
+    for a in ARCHES:
+        name = name.replace(f"-{a}", "")
+    return name
+
+
 def proton_install_dir():
     """where a downloaded GE-Proton goes: Steam's compatibilitytools.d, so Steam can use it too"""
     root = steam_root()
@@ -278,8 +295,9 @@ def proton_versions():
         for n in names:
             p = os.path.join(d, n)
             real = os.path.realpath(p)
-            if os.path.isfile(os.path.join(p, "proton")) and real not in found:
-                found[real] = {"name": n.replace("-x86_64", ""), "path": p}
+            if os.path.isfile(os.path.join(p, "proton")) and real not in found \
+                    and arch_of(n) in ("", MACHINE):  # an ARM build on an x86 PC can't run (Exec format error)
+                found[real] = {"name": proton_label(n), "path": p}
     vs = list(found.values())
     ge = sorted((v for v in vs if v["name"].lower().startswith("ge-proton")), key=lambda v: natural(v["name"]),
                 reverse=True)
@@ -343,7 +361,8 @@ def runner_path(e, s=None):
     """the Proton folder or wine binary this entry runs with ('' if none)"""
     s = s or settings()
     if e["runner"] == "proton":
-        if e["version"] and os.path.isfile(os.path.join(e["version"], "proton")):
+        if e["version"] and os.path.isfile(os.path.join(e["version"], "proton")) \
+                and arch_of(os.path.basename(e["version"])) in ("", MACHINE):
             return e["version"]
         return default_proton(s)
     if e["runner"] == "wine":
@@ -360,7 +379,7 @@ def runner_label(e, s=None):
     if not p:
         return f"{RUNNER_NAMES[e['runner']]} (missing)"
     if e["runner"] == "proton":
-        return os.path.basename(p).replace("-x86_64", "")
+        return proton_label(os.path.basename(p))
     match = next((v["name"] for v in wine_versions() if v["path"] == p), "Wine")
     return match
 
@@ -1248,15 +1267,20 @@ def install_proton(source, report):
     """downloads the newest release of a PROTON_SOURCES Proton into compatibilitytools.d; returns its name"""
     _label, api, suffix = PROTON_SOURCES[source]
     rel = http_json(api)
-    asset = next((a for a in rel["assets"] if a["name"].endswith(suffix)), None)
+    archives = [a for a in rel["assets"] if a["name"].endswith(suffix)]
+    # releases can carry builds for several CPUs (GE-Proton11-12 lists aarch64 first): take this PC's,
+    # or one that names no CPU (older releases were x86_64 only)
+    asset = next((a for a in archives if arch_of(a["name"]) == MACHINE), None) or \
+        next((a for a in archives if not arch_of(a["name"]) and MACHINE == "x86_64"), None)
     if not asset:
-        raise RuntimeError(f"the release has no {suffix}")
-    folder = asset["name"][:-len(suffix)]  # the archive's top folder: GE-Proton10-34, dwproton-11.0-16-x86_64
-    tag = folder.replace("-x86_64", "")  # the name proton_versions() shows
+        raise RuntimeError(f"the release has no {suffix} for {MACHINE}")
+    folder = asset["name"][:-len(suffix)]  # the archive's top folder: GE-Proton11-12-x86_64, dwproton-11.0-16-x86_64
+    tag = proton_label(folder)  # the name proton_versions() shows
     dest = proton_install_dir()
     if os.path.isfile(os.path.join(dest, folder, "proton")):
         return tag
-    sums = next((a for a in rel["assets"] if a["name"].endswith(".sha512sum")), None)
+    sums = next((a for a in rel["assets"] if a["name"] == folder + ".sha512sum"), None) or \
+        next((a for a in rel["assets"] if a["name"].endswith(".sha512sum") and not arch_of(a["name"])), None)
     expected = ""
     if sums:
         expected = http_get(sums["browser_download_url"]).decode().split()[0].lower()
@@ -2066,7 +2090,7 @@ class EditDialog(QDialog):
         if runner == "proton":
             vs = proton_versions()
             d = default_proton(self.s)
-            dname = os.path.basename(d).replace("-x86_64", "") if d else "none installed"
+            dname = proton_label(os.path.basename(d)) if d else "none installed"
             self.version.addItem(f"Default ({dname})", "")
         elif runner == "wine":
             vs = wine_versions()
