@@ -40,11 +40,11 @@ from PyQt6.QtCore import QRectF, QSize, QSocketNotifier, Qt, QThread, QTimer, QO
 from PyQt6.QtGui import (QColor, QFont, QFontMetrics, QIcon, QImage, QKeySequence, QLinearGradient, QPainter,
                          QPainterPath, QPalette, QPixmap, QShortcut)
 from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDialog, QComboBox, QDialog,
-                             QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLabel,
-                             QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
+                             QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QInputDialog,
+                             QKeySequenceEdit, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
                              QScrollArea, QSizePolicy, QSystemTrayIcon, QToolButton, QVBoxLayout, QWidget)
 
-VERSION = "1.7.1"
+VERSION = "1.8.0"
 HOME = os.path.expanduser("~")
 CONF_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "hangar")
 DATA = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local/share"), "hangar")
@@ -105,7 +105,39 @@ DEFAULT_SETTINGS = {
     "prefix_root": os.path.join(HOME, "Games", "Hangar", "prefixes"), "use_umu": True,
     "show_nsfw": False, "blur_nsfw": True, "sgdb_key": "", "vr_options": "", "start_wivrn": True, "wayland": True, "games_root": os.path.join(HOME, "Games"),
     "exe_opener": False, "close_to_tray": True,
+    # NSFW privacy: hide the tab (a key combination shows it), and a password to open it
+    "nsfw_hidden": False, "nsfw_key": "Ctrl+Shift+N", "nsfw_pass": {},
 }
+
+
+def hash_password(pw, salt=None):
+    """{"salt", "hash"}: scrypt (PBKDF2 where OpenSSL has no scrypt); the password itself isn't kept"""
+    salt = salt or os.urandom(16)
+    try:
+        h = hashlib.scrypt(pw.encode(), salt=salt, n=2 ** 14, r=8, p=1, dklen=32)
+        kind = "scrypt"
+    except (AttributeError, ValueError):
+        h = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, 300_000)
+        kind = "pbkdf2"
+    return {"kind": kind, "salt": salt.hex(), "hash": h.hex()}
+
+
+def password_ok(pw, rec):
+    import hmac
+    if not rec or not rec.get("hash"):
+        return True
+    try:
+        salt = bytes.fromhex(rec["salt"])
+    except (KeyError, ValueError):
+        return False
+    if rec.get("kind") == "pbkdf2":
+        h = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, 300_000)
+    else:
+        try:
+            h = hashlib.scrypt(pw.encode(), salt=salt, n=2 ** 14, r=8, p=1, dklen=32)
+        except (AttributeError, ValueError):
+            return False
+    return hmac.compare_digest(h.hex(), rec["hash"])
 
 
 def settings():
@@ -2659,9 +2691,28 @@ class SettingsDialog(QDialog):
         self.show_nsfw = QCheckBox("Show NSFW entries in Library and Favourites too")
         self.show_nsfw.setChecked(self.s["show_nsfw"])
         content.addRow("", self.show_nsfw)
-        self.blur_nsfw = QCheckBox("Blur NSFW covers outside the NSFW tab")
+        self.blur_nsfw = QCheckBox("Blur NSFW covers (point at one to see it)")
         self.blur_nsfw.setChecked(self.s["blur_nsfw"])
         content.addRow("", self.blur_nsfw)
+        self.hide_nsfw = QCheckBox("Hide the NSFW tab: only a key combination shows it")
+        self.hide_nsfw.setChecked(self.s["nsfw_hidden"])
+        content.addRow("", self.hide_nsfw)
+        krow = QHBoxLayout()
+        self.nsfw_key = QKeySequenceEdit(QKeySequence(self.s["nsfw_key"] or "Ctrl+Shift+N"))
+        self.nsfw_key.setMaximumSequenceLength(1)
+        self.nsfw_key.setToolTip("Shows (or hides again) the NSFW tab. Without “Hide the NSFW tab”, it jumps to it")
+        krow.addWidget(self.nsfw_key, 1)
+        krow.addWidget(button("Reset", lambda: self.nsfw_key.setKeySequence(QKeySequence("Ctrl+Shift+N"))))
+        content.addRow("NSFW tab key", krow)
+        prow = QHBoxLayout()
+        self.pass_note = label("", "muted")
+        prow.addWidget(self.pass_note, 1)
+        self.pass_set = button("", self.set_nsfw_password)
+        prow.addWidget(self.pass_set)
+        self.pass_off = button("Remove", self.remove_nsfw_password)
+        prow.addWidget(self.pass_off)
+        content.addRow("NSFW password", prow)
+        self.show_password_state()
         grow2 = QHBoxLayout()
         self.games_root = QLineEdit(self.s["games_root"])
         grow2.addWidget(self.games_root, 1)
@@ -2874,7 +2925,48 @@ class SettingsDialog(QDialog):
             self.wt_btn.setVisible(not path), self.wt_btn.setEnabled(True)))
         self.wt_task.start()
 
+    # NSFW password: changed at once (the old one is asked first), not with Save
+    def show_password_state(self):
+        on = bool((settings().get("nsfw_pass") or {}).get("hash"))
+        self.pass_note.setText("On: the NSFW tab asks for it" if on else "Off")
+        self.pass_set.setText("Change…" if on else "Set a password…")
+        self.pass_off.setVisible(on)
+
+    def check_old_password(self):
+        rec = settings().get("nsfw_pass") or {}
+        if not rec.get("hash"):
+            return True
+        pw, ok = QInputDialog.getText(self, "NSFW password", "Current password:", QLineEdit.EchoMode.Password)
+        if not ok:
+            return False
+        if not password_ok(pw, rec):
+            QMessageBox.warning(self, "NSFW password", "That's not the password.")
+            return False
+        return True
+
+    def set_nsfw_password(self):
+        if not self.check_old_password():
+            return
+        pw, ok = QInputDialog.getText(self, "NSFW password", "New password:", QLineEdit.EchoMode.Password)
+        if not ok or not pw:
+            return
+        again, ok = QInputDialog.getText(self, "NSFW password", "The same password again:", QLineEdit.EchoMode.Password)
+        if not ok:
+            return
+        if again != pw:
+            QMessageBox.warning(self, "NSFW password", "The two didn't match, so the password wasn't changed.")
+            return
+        save_settings(nsfw_pass=hash_password(pw))
+        self.show_password_state()
+
+    def remove_nsfw_password(self):
+        if self.check_old_password():
+            save_settings(nsfw_pass={})
+            self.show_password_state()
+
     def save(self):
+        save_settings(nsfw_hidden=self.hide_nsfw.isChecked(),
+                      nsfw_key=self.nsfw_key.keySequence().toString() or "Ctrl+Shift+N")
         save_settings(theme=self.theme.currentText(), accent=self.accent, size=self.size.currentData(),
                       windows_runner=self.win_runner.currentData(), proton=self.proton.currentData() or "",
                       wine=self.wine.currentData() or "",
@@ -3052,7 +3144,10 @@ class Tile(EntryWidget):
         self.cover = QPushButton(holder)
         self.cover.setObjectName("cover")
         self.cover.setGeometry(0, 0, w, h)
-        self.cover.setIcon(QIcon(picture(e, w - 4, h - 4, "cover", blur, 10)))
+        self.soft = QIcon(picture(e, w - 4, h - 4, "cover", blur, 10))
+        # blurred covers show themselves while you point at them
+        self.sharp = QIcon(picture(e, w - 4, h - 4, "cover", False, 10)) if blur else None
+        self.cover.setIcon(self.soft)
         self.cover.setIconSize(QSize(w - 4, h - 4))
         self.cover.setCursor(Qt.CursorShape.PointingHandCursor)
         self.cover.setToolTip("Double-click to play, right-click for more")
@@ -3081,6 +3176,8 @@ class Tile(EntryWidget):
 
     def eventFilter(self, obj, ev):
         if obj is self.cover:
+            if self.sharp is not None and ev.type() in (ev.Type.Enter, ev.Type.Leave):
+                self.cover.setIcon(self.sharp if ev.type() == ev.Type.Enter else self.soft)
             if ev.type() == ev.Type.MouseButtonDblClick and ev.button() == Qt.MouseButton.LeftButton:
                 self.win.play(self.e["id"])
                 return True
@@ -3200,6 +3297,11 @@ class Window(QMainWindow):
         QShortcut(QKeySequence("Ctrl+F"), self, self.search.setFocus)
         QShortcut(QKeySequence("Ctrl+N"), self, self.add)
         QShortcut(QKeySequence("F5"), self, self.refresh)
+        # NSFW: unlocked until you leave the tab or Hangar is hidden; a hidden tab shows with the key
+        self.nsfw_unlocked = False
+        self.nsfw_shown = False
+        self.nsfw_shortcut = QShortcut(QKeySequence(settings()["nsfw_key"] or "Ctrl+Shift+N"), self,
+                                       self.toggle_nsfw_tab)
         self.refresh()
 
     # helpers
@@ -3212,8 +3314,91 @@ class Window(QMainWindow):
         self.refresh()
 
     def set_tab(self, k):
+        if k != "nsfw":
+            self.nsfw_unlocked = False
         save_settings(tab=k)
         self.refresh()
+
+    # NSFW privacy
+    def nsfw_tab_visible(self):
+        return not self.s["nsfw_hidden"] or self.nsfw_shown
+
+    def nsfw_locked(self):
+        return bool((self.s.get("nsfw_pass") or {}).get("hash")) and not self.nsfw_unlocked
+
+    def nsfw_private(self):
+        """NSFW entries are kept out of every other tab and count while the tab is hidden or locked"""
+        return not self.nsfw_tab_visible() or self.nsfw_locked()
+
+    def toggle_nsfw_tab(self):
+        s = settings()
+        if s["nsfw_hidden"]:
+            self.nsfw_shown = not self.nsfw_shown
+            if not self.nsfw_shown:
+                self.nsfw_unlocked = False
+                if s["tab"] == "nsfw":
+                    save_settings(tab="library")
+            else:
+                save_settings(tab="nsfw")
+        else:
+            if s["tab"] == "nsfw":
+                self.nsfw_unlocked = False
+                save_settings(tab="library")
+            else:
+                save_settings(tab="nsfw")
+        self.refresh()
+
+    def lock_nsfw(self):
+        """hiding Hangar locks NSFW again and hides a hidden tab"""
+        if self.nsfw_unlocked or self.nsfw_shown:
+            self.nsfw_unlocked = False
+            self.nsfw_shown = False
+            if settings()["tab"] == "nsfw" and (settings()["nsfw_hidden"]):
+                save_settings(tab="library")
+            self.refresh()
+
+    def try_unlock(self, field, err):
+        if password_ok(field.text(), self.s.get("nsfw_pass") or {}):
+            self.nsfw_unlocked = True
+            self.refresh()
+        else:
+            field.clear()
+            err.setText("That's not the password")
+            err.show()
+
+    def lock_panel(self):
+        box = QFrame()
+        box.setObjectName("panel")
+        box.setMaximumWidth(420)
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(30, 30, 30, 30)
+        lay.setSpacing(12)
+        icon = label("🔒", "h2")
+        icon.setStyleSheet("font-size: 34px;")
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(icon)
+        t = label("NSFW is locked", "h2")
+        t.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(t)
+        field = QLineEdit()
+        field.setEchoMode(QLineEdit.EchoMode.Password)
+        field.setPlaceholderText("Password")
+        lay.addWidget(field)
+        err = label("", "muted")
+        err.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        err.hide()
+        lay.addWidget(err)
+        go = button("Unlock", lambda: self.try_unlock(field, err), "primary")
+        field.returnPressed.connect(go.click)
+        lay.addWidget(go)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(box)
+        row.addStretch(1)
+        self.items.addSpacing(40)
+        self.items.addLayout(row)
+        self.items.addStretch(1)
+        QTimer.singleShot(0, field.setFocus)
 
     def set_view(self, k):
         save_settings(view=k)
@@ -3242,6 +3427,8 @@ class Window(QMainWindow):
         return out
 
     def in_tab(self, e, tab):
+        if e["nsfw"] and tab != "nsfw" and self.nsfw_private():
+            return False
         if tab == "hidden":
             return e["hidden"]
         if e["hidden"]:
@@ -3283,18 +3470,28 @@ class Window(QMainWindow):
         self.s = settings()
         self.entries = library()
         s = self.s
+        if s["tab"] == "nsfw" and not self.nsfw_tab_visible():
+            save_settings(tab="library")
+            self.s = s = settings()
+        private = self.nsfw_private()
+        counted = [e for e in self.entries if not (private and e["nsfw"])]
         for k, b in self.kind_buttons.items():
             b.setChecked(k == s["kind"])
-            n = sum(1 for e in self.entries if e["kind"] == k and not e["hidden"])
+            n = sum(1 for e in counted if e["kind"] == k and not e["hidden"])
             b.setText(f"{KINDS[k]}  {n}" if n else KINDS[k])
         for k, b in self.tab_buttons.items():
             b.setChecked(k == s["tab"])
+            if k == "nsfw":
+                # never says how many there are
+                b.setVisible(self.nsfw_tab_visible())
+                b.setText(("🔒  " if self.nsfw_locked() else "") + TABS[k])
+                continue
             n = sum(1 for e in self.entries if e["kind"] == s["kind"] and self.in_tab(e, k))
             b.setText(f"{TABS[k]}  {n}" if n and k != "library" else TABS[k])
         self.view_buttons[s["view"]].setChecked(True)
         self.add_btn.setText("+  Add a game" if s["kind"] == "game" else "+  Add an app")
-        games = sum(1 for e in self.entries if e["kind"] == "game")
-        apps = len(self.entries) - games
+        games = sum(1 for e in counted if e["kind"] == "game")
+        apps = len(counted) - games
         running = len(self.launcher.running)
         sub = f"{games} game{'s' * (games != 1)} · {apps} app{'s' * (apps != 1)}"
         if running:
@@ -3303,6 +3500,9 @@ class Window(QMainWindow):
 
         vbar = self.scroll.verticalScrollBar().value()
         self.clear()
+        if s["tab"] == "nsfw" and self.nsfw_locked():
+            self.lock_panel()
+            return
         shown = self.visible_entries()
         if not shown:
             self.empty_state()
@@ -3324,7 +3524,7 @@ class Window(QMainWindow):
         QTimer.singleShot(0, lambda: self.scroll.verticalScrollBar().setValue(vbar))
 
     def blur(self, e):
-        return e["nsfw"] and self.s["blur_nsfw"] and self.s["tab"] != "nsfw"
+        return e["nsfw"] and self.s["blur_nsfw"]
 
     def empty_state(self):
         s = self.s
@@ -3738,6 +3938,7 @@ class Window(QMainWindow):
     def open_settings(self):
         if SettingsDialog(self).exec():
             apply_theme(QApplication.instance())
+            self.nsfw_shortcut.setKey(QKeySequence(settings()["nsfw_key"] or "Ctrl+Shift+N"))
         self.refresh()
 
     # drag and drop
@@ -3793,6 +3994,17 @@ class Window(QMainWindow):
             QApplication.quit()
         else:
             self.quitting = False
+
+    def hideEvent(self, e):
+        # to the tray, minimised, another workspace's hide: NSFW locks again
+        super().hideEvent(e)
+        if not self.isVisible():
+            QTimer.singleShot(0, self.lock_nsfw)
+
+    def changeEvent(self, e):
+        super().changeEvent(e)
+        if e.type() == e.Type.WindowStateChange and self.isMinimized():
+            QTimer.singleShot(0, self.lock_nsfw)
 
     def closeEvent(self, e):
         if not getattr(self, "quitting", False) and settings()["close_to_tray"] \
