@@ -44,7 +44,7 @@ from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDialog
                              QKeySequenceEdit, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
                              QScrollArea, QSizePolicy, QSystemTrayIcon, QToolButton, QVBoxLayout, QWidget)
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 HOME = os.path.expanduser("~")
 CONF_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "hangar")
 DATA = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local/share"), "hangar")
@@ -103,7 +103,7 @@ DEFAULT_SETTINGS = {
     "theme": "Midnight", "accent": "", "view": "grid", "size": "medium", "kind": "game", "tab": "library",
     "sort": "name", "proton": "", "wine": "", "windows_runner": "proton",
     "prefix_root": os.path.join(HOME, "Games", "Hangar", "prefixes"), "use_umu": True,
-    "show_nsfw": False, "blur_nsfw": True, "sgdb_key": "", "vr_options": "", "start_wivrn": True, "wayland": True, "games_root": os.path.join(HOME, "Games"),
+    "show_nsfw": False, "blur_nsfw": True, "sgdb_key": "", "vr_options": "", "start_wivrn": True, "wayland": "auto", "games_root": os.path.join(HOME, "Games"),
     "exe_opener": False, "close_to_tray": True,
     # NSFW privacy: hide the tab (a key combination shows it), and a password to open it
     "nsfw_hidden": False, "nsfw_key": "Ctrl+Shift+N", "nsfw_pass": {},
@@ -143,7 +143,23 @@ def password_ok(pw, rec):
 def settings():
     s = dict(DEFAULT_SETTINGS)
     s.update(read_json(SETTINGS, {}))
+    # Wayland was on or off; on was the default, kept for niri: it's Automatic now (False stays Never)
+    if s["wayland"] is True or s["wayland"] not in ("auto", "on", "off", False):
+        s["wayland"] = "auto"
+    elif s["wayland"] is False:
+        s["wayland"] = "off"
     return s
+
+
+def wayland_on(s):
+    """Proton games as Wayland windows (GE-Proton's Wayland mode)? Automatic: on niri only, where X11
+    windows (through xwayland-satellite) got lost on monitors at negative positions. Elsewhere X11 is
+    better: a Wayland window can't be resized by the compositor unless the program says it's resizable
+    (JKPS stayed 215 × 62), and through XWayland Hyprland, KDE and GNOME resize any window"""
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        return False
+    w = s["wayland"]
+    return w == "on" or (w == "auto" and bool(os.environ.get("NIRI_SOCKET")))
 
 
 def save_settings(**changes):
@@ -697,7 +713,7 @@ def build_command(e, s=None, target=None, extra=None, tool=False):
         if e["mangohud"]:
             env["MANGOHUD"] = "1"
         env.update(anticheat_env(e, env))
-        if s["wayland"] and not e["vr"] and os.environ.get("WAYLAND_DISPLAY"):
+        if wayland_on(s) and not e["vr"]:
             # a native Wayland window: X11 windows get lost on monitors at negative positions (niri). Not for VR
             # games: Proton's OpenVR/DXVK bridge needs X11 (D3D11 fails to create its device otherwise)
             env["PROTON_ENABLE_WAYLAND"] = "1"
@@ -786,6 +802,155 @@ def kill_prefix(e, s=None):
                              start_new_session=True)
         except OSError:
             pass
+
+
+def _environ(pid):
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            return f.read().split(b"\0")
+    except OSError:
+        return []
+
+
+def _in_prefix(env, root):
+    """does a process environment point into the prefix folder `root` (realpath, ending in /)?"""
+    for kv in env:
+        if kv.startswith(b"WINEPREFIX=") or kv.startswith(b"STEAM_COMPAT_DATA_PATH="):
+            v = kv.split(b"=", 1)[1].decode(errors="replace")
+            if v and (os.path.realpath(v).rstrip("/") + "/").startswith(root):
+                return True
+    return False
+
+
+def prefix_procs(e, s=None):
+    """pids of what's running in the entry's prefix: its Windows programs, wineserver, Proton's script
+    (from their environment: WINEPREFIX / STEAM_COMPAT_DATA_PATH). Proton's waitforexitandrun waits for
+    all of it to end first, so a run that crashed or hung there kept every new start from loading"""
+    if e["runner"] == "native":
+        return []
+    root = os.path.realpath(prefix_of(e, s)).rstrip("/") + "/"
+    me = os.getpid()
+    out = []
+    for d in os.listdir("/proc"):
+        if d.isdigit() and int(d) != me and _in_prefix(_environ(d), root):
+            out.append(int(d))
+    return out
+
+
+def stop_prefix(e, s=None, wait=4.0):
+    """stops everything in the entry's prefix (politely, then for good), waiting up to `wait` seconds"""
+    kill_prefix(e, s)
+    pids = prefix_procs(e, s)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    end = time.time() + wait
+    while time.time() < end and prefix_procs(e, s):
+        time.sleep(0.2)
+    for pid in prefix_procs(e, s):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def window_pids():
+    """the pids of the windows on screen, from the compositor (Hyprland, niri); None when it can't say"""
+    try:
+        if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and which("hyprctl"):
+            out = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True, timeout=2,
+                                 env=host_env()).stdout
+            return [int(c.get("pid") or 0) for c in json.loads(out or "[]")]
+        if os.environ.get("NIRI_SOCKET") and which("niri"):
+            out = subprocess.run(["niri", "msg", "-j", "windows"], capture_output=True, text=True, timeout=2,
+                                 env=host_env()).stdout
+            return [int(w.get("pid") or 0) for w in json.loads(out or "[]")]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def _parents():
+    out = {}
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                with open(f"/proc/{d}/stat") as f:
+                    out[int(d)] = int(f.read().rsplit(")", 1)[1].split()[1])
+            except (OSError, ValueError, IndexError):
+                pass
+    return out
+
+
+def has_window(e, root_pid=None, s=None):
+    """True once the entry's program shows a window (one of its prefix's, or a child of root_pid);
+    None when the compositor can't be asked"""
+    pids = window_pids()
+    if pids is None:
+        return None
+    if e["runner"] != "native":
+        root = os.path.realpath(prefix_of(e, s)).rstrip("/") + "/"
+        if any(p and _in_prefix(_environ(p), root) for p in pids):
+            return True
+    if root_pid:
+        par = _parents()
+        for p in pids:
+            seen = 0
+            while p and p != 1 and seen < 64:
+                if p == root_pid:
+                    return True
+                p = par.get(p, 0)
+                seen += 1
+    return False
+
+
+def spinner_pixmap(size, angle, color, ring=None, ratio=1.0):
+    """a loading ring: a faint full circle and a bright arc a quarter-plus long, turned to `angle`"""
+    from PyQt6.QtGui import QPainter, QPen, QColor, QPixmap
+    pm = QPixmap(int(size * ratio), int(size * ratio))
+    pm.setDevicePixelRatio(ratio)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    w = max(2.0, size / 9)
+    r = QRectF(w / 2 + 0.5, w / 2 + 0.5, size - w - 1, size - w - 1)
+    faint = QColor(ring or color)
+    faint.setAlphaF(0.18)
+    pen = QPen(faint, w)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    p.setPen(pen)
+    p.drawEllipse(r)
+    pen.setColor(QColor(color))
+    p.setPen(pen)
+    p.drawArc(r, int(-angle * 16), int(110 * 16))
+    p.end()
+    return pm
+
+
+class Spinner(QLabel):
+    """a loading ring that turns (QuickRun while a program starts)"""
+
+    def __init__(self, size=26, parent=None):
+        super().__init__(parent)
+        self.size_ = size
+        self.angle = 0
+        self.setFixedSize(size, size)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.step)
+
+    def start(self):
+        self.timer.start(16)
+        self.step()
+
+    def stop(self):
+        self.timer.stop()
+
+    def step(self):
+        self.angle = (self.angle + 7) % 360
+        c = self.palette().color(self.palette().ColorRole.Highlight)
+        self.setPixmap(spinner_pixmap(self.size_, self.angle, c, ratio=self.devicePixelRatioF()))
 
 
 def kill_group(p, sig):
@@ -1619,15 +1784,24 @@ class Launcher(QObject):
     changed = pyqtSignal()
     finished = pyqtSignal(str, int, float)
 
+    started = pyqtSignal(str)   # its window showed up
+
     def __init__(self):
         super().__init__()
         self.running = {}
+        self.starting = {}          # eid -> when it was started: still loading (no window yet)
+        self.frame = 0              # the spinner's frame, for the Play buttons
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.poll)
         self.timer.start(1000)
+        self.spin = QTimer(self)
+        self.spin.timeout.connect(self.turn)
 
     def is_running(self, eid):
         return eid in self.running
+
+    def is_starting(self, eid):
+        return eid in self.starting
 
     def launch(self, e):
         if e["id"] in self.running:
@@ -1635,8 +1809,22 @@ class Launcher(QObject):
         p = start_process(e)
         update_entry(e["id"], last_played=int(time.time()))
         self.running[e["id"]] = (p, time.time())
+        self.starting[e["id"]] = time.time()
+        self.spin.start(30)
         self.changed.emit()
         return p
+
+    def turn(self):
+        """the Play buttons' spinner moves on (they read `frame`); stops when nothing is loading"""
+        if not self.starting:
+            self.spin.stop()
+            return
+        self.frame = (self.frame + 1) % 36
+        for b in list(SPIN_BUTTONS):
+            try:
+                spin_icon(b, self.frame)
+            except RuntimeError:   # (gone with a refresh)
+                SPIN_BUTTONS.discard(b)
 
     def stop(self, e):
         item = self.running.get(e["id"])
@@ -1649,10 +1837,21 @@ class Launcher(QObject):
 
     def poll(self):
         ended = False
+        # loading: done once its window shows (or after 3 minutes, or when the compositor can't tell)
+        for eid, t0 in list(self.starting.items()):
+            e = get_entry(eid)
+            item = self.running.get(eid)
+            shown = has_window(e, item[0].pid if item else None) if e else None
+            if not e or shown is not False or time.time() - t0 > 180 or not item:
+                del self.starting[eid]
+                ended = True
+                if shown:
+                    self.started.emit(eid)
         for eid, (p, start) in list(self.running.items()):
             code = p.poll()
             if code is not None:
                 del self.running[eid]
+                self.starting.pop(eid, None)
                 secs = time.time() - start
                 add_playtime(eid, secs)
                 self.finished.emit(eid, code, secs)
@@ -2659,13 +2858,16 @@ class SettingsDialog(QDialog):
         prow.addWidget(button("Browse…", self.browse_root))
         run.addRow("New prefixes go in", prow)
         umu = which("umu-run")
-        self.wayland = QCheckBox("Run Proton games as Wayland windows (not VR games)")
-        self.wayland.setChecked(self.s["wayland"])
-        self.wayland.setToolTip("GE-Proton's Wayland mode (PROTON_ENABLE_WAYLAND=1). Windows then move between "
-                                "monitors properly; through X11 they can vanish on a monitor above or left of the "
-                                "main one. For one game, put PROTON_ENABLE_WAYLAND=0 in its Environment to turn it "
-                                "off.")
-        run.addRow("", self.wayland)
+        self.wayland = QComboBox()
+        for v, t in (("auto", "Automatic (on niri only)"), ("on", "Always"), ("off", "Never")):
+            self.wayland.addItem(t, v)
+        self.wayland.setCurrentIndex(max(0, self.wayland.findData(self.s["wayland"])))
+        self.wayland.setToolTip("GE-Proton's Wayland mode (PROTON_ENABLE_WAYLAND=1), not for VR games. On niri X11 "
+                                "windows can vanish on a monitor above or left of the main one, so Automatic uses "
+                                "it there. Elsewhere X11 is better: a Wayland window can only be resized when the "
+                                "program allows it. For one game, put PROTON_ENABLE_WAYLAND=0 or 1 in its "
+                                "Environment.")
+        run.addRow("Proton games as Wayland windows", self.wayland)
         self.exe_opener = QCheckBox("Open .exe files with Hangar (double-click one to run it)")
         self.exe_opener.setChecked(self.s["exe_opener"])
         self.exe_opener.setToolTip("Hangar becomes the app for Windows programs: opening one from your file manager "
@@ -2973,7 +3175,7 @@ class SettingsDialog(QDialog):
                       prefix_root=self.prefix_root.text().strip() or DEFAULT_SETTINGS["prefix_root"],
                       use_umu=self.use_umu.isChecked(), show_nsfw=self.show_nsfw.isChecked(),
                       vr_options=self.vr_options.text().strip(), start_wivrn=self.start_wivrn.isChecked(),
-                      wayland=self.wayland.isChecked(), exe_opener=self.exe_opener.isChecked(),
+                      wayland=self.wayland.currentData(), exe_opener=self.exe_opener.isChecked(),
                       close_to_tray=self.close_to_tray.isChecked(),
                       blur_nsfw=self.blur_nsfw.isChecked(), sgdb_key=self.sgdb.text().strip(),
                       games_root=self.games_root.text().strip() or DEFAULT_SETTINGS["games_root"])
@@ -3074,8 +3276,32 @@ class EntryWidget(QFrame):
             QTimer.singleShot(0, lambda: self.win.add_to_game_folder(self.e["id"], paths))
 
 
+SPIN_BUTTONS = set()   # the Play buttons of things loading (their spinner turns)
+
+
+def spin_icon(b, frame):
+    """a Play button's loading ring, at `frame` (of 36 turns)"""
+    from PyQt6.QtGui import QIcon
+    size = 16 if b.property("round") else 15
+    c = b.palette().color(b.foregroundRole())
+    b.setIcon(QIcon(spinner_pixmap(size, frame * 10, c, ratio=b.devicePixelRatioF())))
+    b.setIconSize(QSize(size, size))
+
+
 def play_button(win, e, round_=False):
     running = win.launcher.is_running(e["id"])
+    if win.launcher.is_starting(e["id"]):
+        # loading: a spinner until its window shows (a click still stops it)
+        if round_:
+            b = button("", lambda: win.play(e["id"]), "round", "Starting… (click to stop)")
+            b.setFixedSize(38, 38)
+            b.setProperty("round", True)
+        else:
+            b = button(" Starting", lambda: win.play(e["id"]), "primary", "Starting… (click to stop)")
+            b.setMinimumWidth(92)
+        spin_icon(b, win.launcher.frame)
+        SPIN_BUTTONS.add(b)
+        return b
     if round_:
         b = button("■" if running else "▶", lambda: win.play(e["id"]), "roundStop" if running else "round",
                    "Stop" if running else "Play")
@@ -3108,7 +3334,7 @@ class Card(EntryWidget):
         badges = QHBoxLayout()
         badges.setSpacing(6)
         if win.launcher.is_running(e["id"]):
-            badges.addWidget(label("Running", "badgeRun"))
+            badges.addWidget(label("Starting" if win.launcher.is_starting(e["id"]) else "Running", "badgeRun"))
         badges.addWidget(label(runner_label(e, win.s), "badgeAccent" if e["runner"] != "native" else "badge"))
         if e["nsfw"]:
             badges.addWidget(label("NSFW", "badgeNsfw"))
@@ -3156,7 +3382,7 @@ class Tile(EntryWidget):
         pb.setParent(holder)
         pb.move(w - pb.width() - 10, h - pb.height() - 10)
         if win.launcher.is_running(e["id"]):
-            run = label("Running", "badgeRun")
+            run = label("Starting" if win.launcher.is_starting(e["id"]) else "Running", "badgeRun")
             run.setParent(holder)
             run.adjustSize()
             run.move(10, 10)
@@ -3209,6 +3435,7 @@ class Window(QMainWindow):
         self.s = settings()
         self.launcher = Launcher()
         self.launcher.changed.connect(self.refresh)
+        self.launcher.started.connect(lambda eid: self.say(f"{(get_entry(eid) or {}).get('name', 'It')} is up.", 5))
         self.launcher.finished.connect(self.on_finished)
         self.cols = 0
         self.entries = []
@@ -3793,6 +4020,8 @@ class Window(QMainWindow):
             self.launcher.stop(e)
             self.say(f"Stopping {e['name']}…")
             return
+        if not leftovers_ok(self, e, self.s):
+            return
         started_wivrn = e["vr"] and self.s["start_wivrn"] and start_wivrn()
         try:
             self.launcher.launch(e)
@@ -4036,6 +4265,31 @@ class Window(QMainWindow):
 
 # ---- main --------------------------------------------------------------------------------------
 
+def leftovers_ok(parent, e, s=None):
+    """before starting `e`: anything still running in its prefix (it's open already, or its last run
+    crashed or hung) would keep it from starting (Proton waits for it to end). Asks to stop that first;
+    False: don't start"""
+    if not prefix_procs(e, s):
+        return True
+    box = QMessageBox(parent)
+    box.setWindowTitle(f"{e['name']} is still running")
+    box.setText(f"{e['name']} is still running, or what's left of its last run is stuck.")
+    box.setInformativeText("It can't start again until that ends: Proton waits for it, so it would never load. "
+                           "Stop it and start again?")
+    go = box.addButton("Stop it and start", QMessageBox.ButtonRole.AcceptRole)
+    box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(go)
+    box.exec()
+    if box.clickedButton() is not go:
+        return False
+    QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+    try:
+        stop_prefix(e, s)
+    finally:
+        QApplication.restoreOverrideCursor()
+    return True
+
+
 class QuickRun(QDialog):
     """opening a program with Hangar (from the file manager, or `hangar FILE.exe`): its icon and name,
     what runs it, and Run. It can go into the library too; a program already there runs as set up"""
@@ -4113,7 +4367,31 @@ class QuickRun(QDialog):
                                 "it installs to your library.", "muted", wrap=True))
 
         lay.addStretch(1)
-        row = QHBoxLayout()
+        # while it loads: a spinner and what's happening, where the buttons were (Run keeps the window
+        # open until the program's own shows: it used to close at once, and a first start that sets up
+        # its prefix for a minute looked like nothing happened)
+        self.wait = QWidget()
+        wl = QHBoxLayout(self.wait)
+        wl.setContentsMargins(0, 0, 0, 0)
+        wl.setSpacing(12)
+        self.spinner = Spinner(26)
+        wl.addWidget(self.spinner, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.failed = label("✕", "title")
+        self.failed.hide()
+        wl.addWidget(self.failed, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.waitText = label("", "muted", wrap=True)
+        wl.addWidget(self.waitText, 1)
+        self.waitLog = button("Show log", lambda: open_path(self.log_path()))
+        self.waitLog.hide()
+        wl.addWidget(self.waitLog)
+        self.waitClose = button("Close", self.accept)
+        self.waitClose.hide()
+        wl.addWidget(self.waitClose)
+        self.wait.hide()
+        lay.addWidget(self.wait)
+        self.buttons = QWidget()
+        row = QHBoxLayout(self.buttons)
+        row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(button("Open folder", lambda: open_path(os.path.dirname(path))))
         row.addStretch(1)
         row.addWidget(button("Cancel", self.reject))
@@ -4122,7 +4400,10 @@ class QuickRun(QDialog):
         go = button("Run", self.run, "primary")
         go.setDefault(True)
         row.addWidget(go)
-        lay.addLayout(row)
+        lay.addWidget(self.buttons)
+        self.proc = None
+        self.ticks = QTimer(self)
+        self.ticks.timeout.connect(self.tick)
 
     def showEvent(self, ev):
         # a small window of its own size: tiling compositors (niri) float fixed-size windows instead of
@@ -4143,6 +4424,9 @@ class QuickRun(QDialog):
 
     def run(self):
         e = self.chosen()
+        if not leftovers_ok(self, e, self.s):
+            return
+        first = e["runner"] != "native" and not os.path.isdir(os.path.join(wine_prefix(e, self.s), "drive_c"))
         try:
             if self.known or self.keep.isChecked():
                 if not self.known:
@@ -4150,15 +4434,53 @@ class QuickRun(QDialog):
                     e["icon"] = save_exe_icon(e["id"], self.path) if is_windows(self.path) else ""
                     put_entry(e)
                 # through --launch: it keeps the playtime, like a menu shortcut
-                subprocess.Popen(self_command() + ["--launch", e["id"]], env=os.environ.copy(),
-                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 start_new_session=True)
+                self.proc = subprocess.Popen(self_command() + ["--launch", e["id"]], env=os.environ.copy(),
+                                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                             stderr=subprocess.DEVNULL, start_new_session=True)
+                self.logName = e["id"]
             else:
-                start_process(e, self.s, log_name="quick")
+                self.proc = start_process(e, self.s, log_name="quick")
+                self.logName = "quick"
         except (LaunchError, OSError) as ex:
             QMessageBox.warning(self, "Can't run it", str(ex))
             return
-        self.accept()
+        self.running = e
+        self.t0 = time.time()
+        self.buttons.hide()
+        self.wait.show()
+        self.waitText.setText(f"Starting {e['name']}…" + (" The first start sets up its prefix: about a minute."
+                                                          if first else ""))
+        self.spinner.start()
+        self.ticks.start(90)
+
+    def log_path(self):
+        return os.path.join(LOGS, f"{getattr(self, 'logName', 'quick')}.log")
+
+    def tick(self):
+        """the spinner turns; every ~0.7 s: is its window there yet, did it end?"""
+        now = time.time()
+        if now - getattr(self, "checked", 0) < 0.7:
+            return
+        self.checked = now
+        code = self.proc.poll() if self.proc else None
+        if code is not None:
+            self.ticks.stop()
+            if code != 0 and now - self.t0 < 60:
+                # it ended right away: say so (it used to just vanish), with its log
+                self.spinner.stop()
+                self.spinner.hide()
+                self.failed.show()
+                self.waitText.setText(f"{self.running['name']} closed right away (exit code {code}).")
+                self.waitLog.show()
+                self.waitClose.show()
+            else:
+                self.accept()
+            return
+        shown = has_window(self.running, self.proc.pid if self.proc else None, self.s)
+        # (its window is up; or this compositor can't tell: a few seconds of it starting, then done)
+        if shown or (shown is None and now - self.t0 > 6) or now - self.t0 > 180:
+            self.ticks.stop()
+            self.accept()
 
     def install(self):
         """the installer goes through the main window, which finds the installed game and adds it"""
@@ -4177,6 +4499,8 @@ def cli_run(path):
     e, known = quick_entry(path)
     if known:
         return cli_launch(e["id"])
+    if cli_busy(e):
+        return 1
     try:
         p = start_process(e, log_name="quick")
     except (LaunchError, OSError) as ex:
@@ -4191,10 +4515,24 @@ def cli_run(path):
         return p.wait()
 
 
+def cli_busy(e):
+    """a menu shortcut / --run for something whose prefix is busy: it's open already, or its last run is
+    stuck (and Proton would wait for that forever). Says so instead of starting nothing; True: busy"""
+    if not prefix_procs(e):
+        return False
+    msg = "It's open already, or its last run is stuck. Open it from Hangar to stop that and start again."
+    print(f"hangar: {e['name']} is still running. {msg}", file=sys.stderr)
+    subprocess.run(["notify-send", "-a", "Hangar", f"{e['name']} is still running", msg], env=host_env(),
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    return True
+
+
 def cli_launch(eid):
     e = get_entry(eid)
     if not e:
         print(f"hangar: no entry {eid}", file=sys.stderr)
+        return 1
+    if cli_busy(e):
         return 1
     if e["vr"] and settings()["start_wivrn"]:
         start_wivrn()
