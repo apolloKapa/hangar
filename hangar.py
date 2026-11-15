@@ -20,6 +20,7 @@ files where they are.
 """
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -44,7 +45,7 @@ from PyQt6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QColorDialog
                              QKeySequenceEdit, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
                              QScrollArea, QSizePolicy, QSystemTrayIcon, QToolButton, QVBoxLayout, QWidget)
 
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 HOME = os.path.expanduser("~")
 CONF_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "hangar")
 DATA = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local/share"), "hangar")
@@ -4290,6 +4291,60 @@ def leftovers_ok(parent, e, s=None):
     return True
 
 
+class LoadingRing(QWidget):
+    """the program's icon with a ring turning round it (QuickRun's loading screen); `done` stops it
+    as a full ring"""
+
+    def __init__(self, pm, size=120, parent=None):
+        super().__init__(parent)
+        self.pm = pm
+        self.angle = 0
+        self.done = False
+        self.setFixedSize(size, size)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.step)
+
+    def start(self):
+        self.timer.start(16)
+
+    def finish(self):
+        self.done = True
+        self.timer.stop()
+        self.update()
+
+    def step(self):
+        self.angle = (self.angle + 5) % 360
+        self.update()
+
+    def paintEvent(self, _ev):
+        from PyQt6.QtGui import QPen
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        size = self.width()
+        w = max(3.0, size / 26)
+        r = QRectF(w / 2 + 1, w / 2 + 1, size - w - 2, size - w - 2)
+        acc = self.palette().color(QPalette.ColorRole.Highlight)
+        faint = QColor(acc)
+        faint.setAlphaF(0.16)
+        pen = QPen(faint, w)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.drawEllipse(r)
+        pen.setColor(acc)
+        p.setPen(pen)
+        if self.done:
+            p.drawEllipse(r)
+        else:
+            # an arc that grows and shrinks as it turns
+            span = 70 + 60 * (1 + math.sin(math.radians(self.angle * 2))) / 2
+            p.drawArc(r, int(-self.angle * 2 * 16), int(span * 16))
+        inner = int(size * 0.56)
+        if self.pm and not self.pm.isNull():
+            pm = self.pm.scaled(inner, inner, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            p.drawPixmap((size - pm.width()) // 2, (size - pm.height()) // 2, pm)
+        p.end()
+
+
 class QuickRun(QDialog):
     """opening a program with Hangar (from the file manager, or `hangar FILE.exe`): its icon and name,
     what runs it, and Run. It can go into the library too; a program already there runs as set up"""
@@ -4312,9 +4367,10 @@ class QuickRun(QDialog):
         pm = QPixmap()
         data = exe_icon(path) if is_windows(path) else None
         if data and pm.loadFromData(data) and not pm.isNull():
-            pic.setPixmap(rounded(pm, 72, 72, 14, fit=True))
+            self.icon = rounded(pm, 144, 144, 28, fit=True)
         else:
-            pic.setPixmap(placeholder(self.e["name"], 72, 72, r=14))
+            self.icon = placeholder(self.e["name"], 144, 144, r=28)
+        pic.setPixmap(self.icon.scaled(72, 72, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         top.addWidget(pic, 0, Qt.AlignmentFlag.AlignTop)
         col = QVBoxLayout()
         col.setSpacing(4)
@@ -4367,28 +4423,6 @@ class QuickRun(QDialog):
                                 "it installs to your library.", "muted", wrap=True))
 
         lay.addStretch(1)
-        # while it loads: a spinner and what's happening, where the buttons were (Run keeps the window
-        # open until the program's own shows: it used to close at once, and a first start that sets up
-        # its prefix for a minute looked like nothing happened)
-        self.wait = QWidget()
-        wl = QHBoxLayout(self.wait)
-        wl.setContentsMargins(0, 0, 0, 0)
-        wl.setSpacing(12)
-        self.spinner = Spinner(26)
-        wl.addWidget(self.spinner, 0, Qt.AlignmentFlag.AlignVCenter)
-        self.failed = label("✕", "title")
-        self.failed.hide()
-        wl.addWidget(self.failed, 0, Qt.AlignmentFlag.AlignVCenter)
-        self.waitText = label("", "muted", wrap=True)
-        wl.addWidget(self.waitText, 1)
-        self.waitLog = button("Show log", lambda: open_path(self.log_path()))
-        self.waitLog.hide()
-        wl.addWidget(self.waitLog)
-        self.waitClose = button("Close", self.accept)
-        self.waitClose.hide()
-        wl.addWidget(self.waitClose)
-        self.wait.hide()
-        lay.addWidget(self.wait)
         self.buttons = QWidget()
         row = QHBoxLayout(self.buttons)
         row.setContentsMargins(0, 0, 0, 0)
@@ -4404,6 +4438,40 @@ class QuickRun(QDialog):
         self.proc = None
         self.ticks = QTimer(self)
         self.ticks.timeout.connect(self.tick)
+        # the loading screen: Run turns the whole window into it (it was a small spinner in the
+        # buttons' row, gone again in a few seconds: easy to miss)
+        self.loading = QWidget(self)
+        self.loading.setObjectName("loadingPage")
+        self.loading.setAutoFillBackground(True)
+        ll = QVBoxLayout(self.loading)
+        ll.setContentsMargins(22, 18, 22, 18)
+        ll.setSpacing(10)
+        ll.addStretch(1)
+        self.ring = LoadingRing(self.icon, 96)
+        ll.addWidget(self.ring, 0, Qt.AlignmentFlag.AlignHCenter)
+        self.loadTitle = label("", "title")
+        self.loadTitle.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        ll.addWidget(self.loadTitle)
+        self.loadText = label("", "muted", wrap=True)
+        self.loadText.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        ll.addWidget(self.loadText)
+        ll.addStretch(1)
+        lrow = QHBoxLayout()
+        lrow.addStretch(1)
+        self.waitLog = button("Show log", lambda: open_path(self.log_path()))
+        lrow.addWidget(self.waitLog)
+        self.waitClose = button("Close", self.accept)
+        lrow.addWidget(self.waitClose)
+        self.waitHide = button("Hide", self.accept, None, "Close this window; the program keeps starting")
+        lrow.addWidget(self.waitHide)
+        ll.addLayout(lrow)
+        self.waitLog.hide()
+        self.waitClose.hide()
+        self.loading.hide()
+
+    def resizeEvent(self, ev):
+        self.loading.setGeometry(self.rect())
+        super().resizeEvent(ev)
 
     def showEvent(self, ev):
         # a small window of its own size: tiling compositors (niri) float fixed-size windows instead of
@@ -4445,42 +4513,64 @@ class QuickRun(QDialog):
             QMessageBox.warning(self, "Can't run it", str(ex))
             return
         self.running = e
+        self.first = first
         self.t0 = time.time()
-        self.buttons.hide()
-        self.wait.show()
-        self.waitText.setText(f"Starting {e['name']}…" + (" The first start sets up its prefix: about a minute."
-                                                          if first else ""))
-        self.spinner.start()
-        self.ticks.start(90)
+        self.readyAt = 0
+        self.loading.setGeometry(self.rect())
+        self.loading.show()
+        self.loading.raise_()
+        self.loadTitle.setText(f"Starting {e['name']}")
+        self.loadText.setText("Starting Proton…" if e["runner"] == "proton" else "Starting…")
+        self.ring.start()
+        self.ticks.start(100)
 
     def log_path(self):
         return os.path.join(LOGS, f"{getattr(self, 'logName', 'quick')}.log")
 
     def tick(self):
-        """the spinner turns; every ~0.7 s: is its window there yet, did it end?"""
+        """every ~0.7 s: is its window there yet, did it end? (and what to say meanwhile)"""
         now = time.time()
+        el = int(now - self.t0)
+        if self.readyAt:
+            # its window is up: "Ready" for a moment, then gone
+            if now - self.readyAt > 0.8:
+                self.ticks.stop()
+                self.accept()
+            return
         if now - getattr(self, "checked", 0) < 0.7:
             return
         self.checked = now
         code = self.proc.poll() if self.proc else None
         if code is not None:
-            self.ticks.stop()
             if code != 0 and now - self.t0 < 60:
                 # it ended right away: say so (it used to just vanish), with its log
-                self.spinner.stop()
-                self.spinner.hide()
-                self.failed.show()
-                self.waitText.setText(f"{self.running['name']} closed right away (exit code {code}).")
+                self.ticks.stop()
+                self.ring.finish()
+                self.loadTitle.setText(f"{self.running['name']} closed right away")
+                self.loadText.setText(f"Exit code {code}. Its log says what went wrong.")
+                self.waitHide.hide()
                 self.waitLog.show()
                 self.waitClose.show()
             else:
+                self.ticks.stop()
                 self.accept()
             return
         shown = has_window(self.running, self.proc.pid if self.proc else None, self.s)
-        # (its window is up; or this compositor can't tell: a few seconds of it starting, then done)
-        if shown or (shown is None and now - self.t0 > 6) or now - self.t0 > 180:
+        # (its window is up; or this compositor can't tell: some seconds of starting, then done)
+        if (shown or (shown is None and now - self.t0 > 8)) and now - self.t0 > 1.2:
+            self.readyAt = now
+            self.ring.finish()
+            self.loadTitle.setText(f"{self.running['name']} is ready")
+            self.loadText.setText(f"Started in {max(1, el)} s")
+            return
+        if now - self.t0 > 180:
             self.ticks.stop()
             self.accept()
+            return
+        what = ("Starting Proton…" if el < 3 else ("Setting up its prefix (the first start takes about a minute)…"
+                                                   if self.first else "Waiting for its window…")) \
+            if self.running["runner"] != "native" else "Waiting for its window…"
+        self.loadText.setText(f"{what}  {el} s")
 
     def install(self):
         """the installer goes through the main window, which finds the installed game and adds it"""
